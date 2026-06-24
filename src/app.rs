@@ -6,27 +6,161 @@ pub enum LoadState {
     Error(String),
 }
 
+/// All filterable dimensions, in the order they appear in the filter menu.
+pub const FILTER_KINDS: [FilterKind; 4] = [
+    FilterKind::Team,
+    FilterKind::Project,
+    FilterKind::Status,
+    FilterKind::Blocked,
+];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FilterKind {
     Team,
     Project,
     Status,
+    Blocked,
 }
 
 impl FilterKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            FilterKind::Team => "Team",
+            FilterKind::Project => "Project",
+            FilterKind::Status => "Status",
+            FilterKind::Blocked => "Blocked",
+        }
+    }
+
+    /// Multi-select dimensions show checkboxes and accumulate values;
+    /// single-select dimensions pick exactly one value (or the default).
     pub fn is_multi(self) -> bool {
         matches!(self, FilterKind::Status)
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BlockedFilter {
+    Any,
+    UnblockedOnly,
+    BlockedOnly,
+}
+
+impl BlockedFilter {
+    const OPTIONS: [&'static str; 3] = ["Any", "Unblocked only", "Blocked only"];
+
+    fn label(self) -> &'static str {
+        Self::OPTIONS[self as usize]
+    }
+
+    fn from_index(i: usize) -> Self {
+        match i {
+            1 => BlockedFilter::UnblockedOnly,
+            2 => BlockedFilter::BlockedOnly,
+            _ => BlockedFilter::Any,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Updated,
+    Priority,
+}
+
+impl SortKey {
+    pub fn label(self) -> &'static str {
+        match self {
+            SortKey::Updated => "updated",
+            SortKey::Priority => "priority",
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            SortKey::Updated => SortKey::Priority,
+            SortKey::Priority => SortKey::Updated,
+        }
+    }
+}
+
 pub enum Mode {
     Normal,
+    /// Top-level "Filters" menu: one row per FilterKind, showing its current value.
+    FilterMenu {
+        selected: usize,
+    },
+    /// Editing a single filter dimension's value(s).
     Filter {
         kind: FilterKind,
         options: Vec<String>,
         selected: usize,
         checked: Vec<bool>,
     },
+    /// Viewing the selected issue's full details in an overlay.
+    Detail,
+}
+
+#[derive(Default)]
+pub struct Filters {
+    pub team: Option<String>,
+    pub project: Option<String>,
+    pub status: Vec<String>,
+    pub blocked: Option<BlockedFilter>,
+}
+
+impl Filters {
+    fn blocked(&self) -> BlockedFilter {
+        self.blocked.unwrap_or(BlockedFilter::Any)
+    }
+
+    pub fn is_active(&self, kind: FilterKind) -> bool {
+        match kind {
+            FilterKind::Team => self.team.is_some(),
+            FilterKind::Project => self.project.is_some(),
+            FilterKind::Status => !self.status.is_empty(),
+            FilterKind::Blocked => self.blocked() != BlockedFilter::Any,
+        }
+    }
+
+    pub fn summary(&self, kind: FilterKind) -> String {
+        match kind {
+            FilterKind::Team => self.team.clone().unwrap_or_else(|| "All".to_string()),
+            FilterKind::Project => self.project.clone().unwrap_or_else(|| "All".to_string()),
+            FilterKind::Status => {
+                if self.status.is_empty() {
+                    "All".to_string()
+                } else {
+                    self.status.join(", ")
+                }
+            }
+            FilterKind::Blocked => self.blocked().label().to_string(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.team = None;
+        self.project = None;
+        self.status.clear();
+        self.blocked = None;
+    }
+
+    fn matches(&self, issue: &Issue) -> bool {
+        self.team.as_ref().map_or(true, |t| &issue.team.name == t)
+            && self.project.as_ref().map_or(true, |p| {
+                issue
+                    .project
+                    .as_ref()
+                    .map(|proj| &proj.name == p)
+                    .unwrap_or(false)
+            })
+            && (self.status.is_empty() || self.status.iter().any(|s| s == &issue.state.name))
+            && match self.blocked() {
+                BlockedFilter::Any => true,
+                BlockedFilter::UnblockedOnly => !issue.is_blocked(),
+                BlockedFilter::BlockedOnly => issue.is_blocked(),
+            }
+    }
 }
 
 pub struct App {
@@ -35,9 +169,8 @@ pub struct App {
     pub selected: usize,
     pub load_state: LoadState,
     pub should_quit: bool,
-    pub team_filter: Option<String>,
-    pub project_filter: Option<String>,
-    pub status_filter: Vec<String>,
+    pub filters: Filters,
+    pub sort_key: SortKey,
     pub mode: Mode,
 }
 
@@ -51,19 +184,21 @@ impl App {
             selected: 0,
             load_state: LoadState::Loading,
             should_quit: false,
-            team_filter: None,
-            project_filter: None,
-            status_filter: Vec::new(),
+            filters: Filters::default(),
+            sort_key: SortKey::Updated,
             mode: Mode::Normal,
         }
     }
 
     pub fn set_issues(&mut self, issues: Vec<Issue>) {
         self.all_issues = issues;
-        self.team_filter = None;
-        self.project_filter = None;
-        self.status_filter.clear();
+        self.filters.clear();
         self.load_state = LoadState::Loaded;
+        self.apply_filters();
+    }
+
+    pub fn toggle_sort(&mut self) {
+        self.sort_key = self.sort_key.toggled();
         self.apply_filters();
     }
 
@@ -91,101 +226,126 @@ impl App {
         self.issues = self
             .all_issues
             .iter()
-            .filter(|issue| {
-                self.team_filter
-                    .as_ref()
-                    .map_or(true, |t| &issue.team.name == t)
-            })
-            .filter(|issue| {
-                self.project_filter.as_ref().map_or(true, |p| {
-                    issue
-                        .project
-                        .as_ref()
-                        .map(|proj| &proj.name == p)
-                        .unwrap_or(false)
-                })
-            })
-            .filter(|issue| {
-                self.status_filter.is_empty()
-                    || self.status_filter.iter().any(|s| s == &issue.state.name)
-            })
+            .filter(|issue| self.filters.matches(issue))
             .cloned()
             .collect();
+
+        match self.sort_key {
+            SortKey::Updated => self.issues.sort_by(|a, b| b.updated_at.cmp(&a.updated_at)),
+            SortKey::Priority => self
+                .issues
+                .sort_by_key(|i| (i.priority_rank(), i.identifier.clone())),
+        }
+
         self.selected = 0;
     }
 
     pub fn clear_filters(&mut self) {
-        self.team_filter = None;
-        self.project_filter = None;
-        self.status_filter.clear();
+        self.filters.clear();
         self.apply_filters();
     }
 
-    pub fn open_team_filter(&mut self) {
-        let mut names: Vec<String> = self
-            .all_issues
-            .iter()
-            .map(|i| i.team.name.clone())
-            .collect();
-        names.sort();
-        names.dedup();
-        let mut options = vec![ALL_LABEL.to_string()];
-        options.extend(names);
-        let selected = self
-            .team_filter
-            .as_ref()
-            .and_then(|t| options.iter().position(|o| o == t))
-            .unwrap_or(0);
-        let checked = vec![false; options.len()];
-        self.mode = Mode::Filter {
-            kind: FilterKind::Team,
-            options,
-            selected,
-            checked,
-        };
+    pub fn open_detail(&mut self) {
+        if self.selected_issue().is_some() {
+            self.mode = Mode::Detail;
+        }
     }
 
-    pub fn open_project_filter(&mut self) {
-        let mut names: Vec<String> = self
-            .all_issues
-            .iter()
-            .filter_map(|i| i.project.as_ref().map(|p| p.name.clone()))
-            .collect();
-        names.sort();
-        names.dedup();
-        let mut options = vec![ALL_LABEL.to_string()];
-        options.extend(names);
-        let selected = self
-            .project_filter
-            .as_ref()
-            .and_then(|p| options.iter().position(|o| o == p))
-            .unwrap_or(0);
-        let checked = vec![false; options.len()];
-        self.mode = Mode::Filter {
-            kind: FilterKind::Project,
-            options,
-            selected,
-            checked,
-        };
+    pub fn close_detail(&mut self) {
+        self.mode = Mode::Normal;
     }
 
-    pub fn open_status_filter(&mut self) {
-        let mut names: Vec<String> = self
-            .all_issues
-            .iter()
-            .map(|i| i.state.name.clone())
-            .collect();
-        names.sort();
-        names.dedup();
-        let options = names;
-        let checked: Vec<bool> = options
-            .iter()
-            .map(|o| self.status_filter.iter().any(|s| s == o))
-            .collect();
+    pub fn open_filter_menu(&mut self) {
+        self.mode = Mode::FilterMenu { selected: 0 };
+    }
+
+    pub fn filter_menu_move(&mut self, delta: i32) {
+        if let Mode::FilterMenu { selected } = &mut self.mode {
+            let len = FILTER_KINDS.len() as i32;
+            *selected = ((*selected as i32 + delta).rem_euclid(len)) as usize;
+        }
+    }
+
+    pub fn filter_menu_select(&mut self) {
+        if let Mode::FilterMenu { selected } = &self.mode {
+            match FILTER_KINDS[*selected] {
+                FilterKind::Team => self.open_value_filter(FilterKind::Team),
+                FilterKind::Project => self.open_value_filter(FilterKind::Project),
+                FilterKind::Status => self.open_value_filter(FilterKind::Status),
+                FilterKind::Blocked => self.open_value_filter(FilterKind::Blocked),
+            }
+        }
+    }
+
+    pub fn filter_menu_cancel(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
+    fn open_value_filter(&mut self, kind: FilterKind) {
+        let (options, selected, checked) = match kind {
+            FilterKind::Team => {
+                let mut names: Vec<String> =
+                    self.all_issues.iter().map(|i| i.team.name.clone()).collect();
+                names.sort();
+                names.dedup();
+                let mut options = vec![ALL_LABEL.to_string()];
+                options.extend(names);
+                let selected = self
+                    .filters
+                    .team
+                    .as_ref()
+                    .and_then(|t| options.iter().position(|o| o == t))
+                    .unwrap_or(0);
+                let checked = vec![false; options.len()];
+                (options, selected, checked)
+            }
+            FilterKind::Project => {
+                let mut names: Vec<String> = self
+                    .all_issues
+                    .iter()
+                    .filter_map(|i| i.project.as_ref().map(|p| p.name.clone()))
+                    .collect();
+                names.sort();
+                names.dedup();
+                let mut options = vec![ALL_LABEL.to_string()];
+                options.extend(names);
+                let selected = self
+                    .filters
+                    .project
+                    .as_ref()
+                    .and_then(|p| options.iter().position(|o| o == p))
+                    .unwrap_or(0);
+                let checked = vec![false; options.len()];
+                (options, selected, checked)
+            }
+            FilterKind::Status => {
+                let mut names: Vec<String> =
+                    self.all_issues.iter().map(|i| i.state.name.clone()).collect();
+                names.sort();
+                names.dedup();
+                let checked: Vec<bool> = names
+                    .iter()
+                    .map(|o| self.filters.status.iter().any(|s| s == o))
+                    .collect();
+                (names, 0, checked)
+            }
+            FilterKind::Blocked => {
+                let options: Vec<String> =
+                    BlockedFilter::OPTIONS.iter().map(|s| s.to_string()).collect();
+                let selected = match self.filters.blocked() {
+                    BlockedFilter::Any => 0,
+                    BlockedFilter::UnblockedOnly => 1,
+                    BlockedFilter::BlockedOnly => 2,
+                };
+                let checked = vec![false; options.len()];
+                (options, selected, checked)
+            }
+        };
+
         self.mode = Mode::Filter {
-            kind: FilterKind::Status,
+            kind,
             options,
-            selected: 0,
+            selected,
             checked,
         };
     }
@@ -219,6 +379,7 @@ impl App {
     }
 
     pub fn filter_confirm(&mut self) {
+        let mut return_to = 0;
         if let Mode::Filter {
             kind,
             options,
@@ -226,6 +387,7 @@ impl App {
             checked,
         } = &self.mode
         {
+            return_to = FILTER_KINDS.iter().position(|k| k == kind).unwrap_or(0);
             if kind.is_multi() {
                 let chosen: Vec<String> = options
                     .iter()
@@ -233,25 +395,33 @@ impl App {
                     .filter(|(_, &c)| c)
                     .map(|(o, _)| o.clone())
                     .collect();
-                match kind {
-                    FilterKind::Status => self.status_filter = chosen,
-                    _ => {}
+                if *kind == FilterKind::Status {
+                    self.filters.status = chosen;
                 }
             } else {
-                let choice = options.get(*selected).cloned();
-                let value = choice.filter(|c| c != ALL_LABEL);
+                let value = options.get(*selected).cloned().filter(|c| c != ALL_LABEL);
                 match kind {
-                    FilterKind::Team => self.team_filter = value,
-                    FilterKind::Project => self.project_filter = value,
+                    FilterKind::Team => self.filters.team = value,
+                    FilterKind::Project => self.filters.project = value,
+                    FilterKind::Blocked => {
+                        self.filters.blocked = Some(BlockedFilter::from_index(*selected))
+                    }
                     FilterKind::Status => {}
                 }
             }
         }
-        self.mode = Mode::Normal;
+        self.mode = Mode::FilterMenu {
+            selected: return_to,
+        };
         self.apply_filters();
     }
 
     pub fn filter_cancel(&mut self) {
-        self.mode = Mode::Normal;
+        if let Mode::Filter { kind, .. } = &self.mode {
+            let idx = FILTER_KINDS.iter().position(|k| k == kind).unwrap_or(0);
+            self.mode = Mode::FilterMenu { selected: idx };
+        } else {
+            self.mode = Mode::Normal;
+        }
     }
 }

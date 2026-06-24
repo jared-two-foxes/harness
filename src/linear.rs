@@ -36,11 +36,57 @@ pub struct Issue {
     pub url: String,
     pub description: Option<String>,
     pub assignee: Option<Assignee>,
+    #[serde(rename = "inverseRelations")]
+    pub inverse_relations: RelationConnection,
+}
+
+impl Issue {
+    /// True if another (non-completed, non-cancelled) issue blocks this one.
+    pub fn is_blocked(&self) -> bool {
+        self.inverse_relations
+            .nodes
+            .iter()
+            .any(|r| r.relation_type == "blocks" && !r.related_issue.is_done())
+    }
+
+    /// Sort key where lower sorts first: Urgent(1) < High(2) < Medium(3) < Low(4) < None(0).
+    pub fn priority_rank(&self) -> i64 {
+        let p = self.priority as i64;
+        if p == 0 {
+            5
+        } else {
+            p
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Assignee {
     pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelationConnection {
+    pub nodes: Vec<IssueRelation>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueRelation {
+    #[serde(rename = "type")]
+    pub relation_type: String,
+    #[serde(rename = "relatedIssue")]
+    pub related_issue: RelatedIssue,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelatedIssue {
+    pub state: State,
+}
+
+impl RelatedIssue {
+    fn is_done(&self) -> bool {
+        matches!(self.state.state_type.as_str(), "completed" | "canceled")
+    }
 }
 
 #[derive(Deserialize)]
@@ -96,6 +142,12 @@ impl Client {
                         url
                         description
                         assignee { name }
+                        inverseRelations {
+                            nodes {
+                                type
+                                relatedIssue { state { name type } }
+                            }
+                        }
                     }
                 }
             }

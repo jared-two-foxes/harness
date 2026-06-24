@@ -70,14 +70,29 @@ async fn run(
                             KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
                             KeyCode::Char('j') | KeyCode::Down => app.select_next(),
                             KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
-                            KeyCode::Char('t') => app.open_team_filter(),
-                            KeyCode::Char('p') => app.open_project_filter(),
-                            KeyCode::Char('s') => app.open_status_filter(),
-                            KeyCode::Char('c') => app.clear_filters(),
+                            KeyCode::Char('f') => app.open_filter_menu(),
+                            KeyCode::Char('o') => app.toggle_sort(),
+                            KeyCode::Enter | KeyCode::Char('l') => app.open_detail(),
                             KeyCode::Char('r') => match client.fetch_my_issues().await {
                                 Ok(issues) => app.set_issues(issues),
                                 Err(e) => app.set_error(format!("{e:?}")),
                             },
+                            _ => {}
+                        },
+                        Mode::Detail => match key.code {
+                            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('h') => {
+                                app.close_detail()
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => app.select_next(),
+                            KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
+                            _ => {}
+                        },
+                        Mode::FilterMenu { .. } => match key.code {
+                            KeyCode::Esc => app.filter_menu_cancel(),
+                            KeyCode::Enter => app.filter_menu_select(),
+                            KeyCode::Char('j') | KeyCode::Down => app.filter_menu_move(1),
+                            KeyCode::Char('k') | KeyCode::Up => app.filter_menu_move(-1),
+                            KeyCode::Char('c') => app.clear_filters(),
                             _ => {}
                         },
                         Mode::Filter { .. } => match key.code {
