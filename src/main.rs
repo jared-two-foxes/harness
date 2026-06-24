@@ -1,4 +1,5 @@
 mod app;
+mod extensions;
 mod linear;
 mod markdown;
 mod ui;
@@ -12,8 +13,10 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use tokio::sync::mpsc;
 
 use app::{App, Mode};
+use extensions::ExtensionRunResult;
 use linear::Client;
 
 fn load_api_key() -> Result<String> {
@@ -39,6 +42,11 @@ async fn main() -> Result<()> {
         Err(e) => app.set_error(format!("{e:?}")),
     }
 
+    match extensions::load() {
+        Ok(exts) => app.extensions = exts,
+        Err(e) => eprintln!("warning: failed to load extensions config: {e:?}"),
+    }
+
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -54,13 +62,35 @@ async fn main() -> Result<()> {
     result
 }
 
+/// Spawns the extension's command in the background and routes its result
+/// back through `tx` once it finishes, without blocking the UI loop.
+fn launch_extension(app: &mut App, key: char, tx: mpsc::UnboundedSender<ExtensionRunResult>) {
+    let Some(extension) = app.find_extension(key) else {
+        return;
+    };
+    let Some(issue) = app.selected_issue().cloned() else {
+        return;
+    };
+    app.start_extension(extension.name.clone());
+    tokio::spawn(async move {
+        let result = extensions::run(&extension, &issue).await;
+        let _ = tx.send(result);
+    });
+}
+
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
     client: &Client,
 ) -> Result<()> {
+    let (ext_tx, mut ext_rx) = mpsc::unbounded_channel::<ExtensionRunResult>();
+
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, app))?;
+
+        while let Ok(result) = ext_rx.try_recv() {
+            app.finish_extension(result);
+        }
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
@@ -77,6 +107,7 @@ async fn run(
                                 Ok(issues) => app.set_issues(issues),
                                 Err(e) => app.set_error(format!("{e:?}")),
                             },
+                            KeyCode::Char(c) => launch_extension(app, c, ext_tx.clone()),
                             _ => {}
                         },
                         Mode::Detail => match key.code {
@@ -85,6 +116,11 @@ async fn run(
                             }
                             KeyCode::Char('j') | KeyCode::Down => app.select_next(),
                             KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
+                            KeyCode::Char(c) => launch_extension(app, c, ext_tx.clone()),
+                            _ => {}
+                        },
+                        Mode::ExtensionOutput { .. } => match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => app.close_extension_output(),
                             _ => {}
                         },
                         Mode::FilterMenu { .. } => match key.code {

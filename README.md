@@ -62,3 +62,44 @@ Editing a single filter:
 - Full-screen detail view with team, assignee, state, priority, blocked status, and a markdown-rendered description
 - Filter issues by team, project, status (multi-select), and blocked state (any / unblocked only / blocked only), all from one consolidated filters menu
 - Blocked issues (per Linear's issue relations) are marked with a `!` in the list and called out in the detail view
+- Extensible: bind custom hotkeys to external commands (e.g. your own AI code-generation scripts) that run against the selected issue
+
+## Extensions
+
+Extensions let you bind a key to an external command that runs against the currently
+selected issue — e.g. an `agentic` code-gen script that takes an issue identifier and
+title and goes off to generate a PR. Harness shells out via `process::Command`
+(`cmd /C` on Windows, `sh -c` elsewhere) and runs the command in the background so the
+UI stays responsive; the captured stdout/stderr is shown in a results view when it's done.
+
+Define extensions in `~/.harness/extensions.toml`:
+
+```toml
+[[extension]]
+key = "g"
+name = "Generate code"
+command = "python3 ~/scripts/gen_code.py --issue {identifier} --title \"{title}\""
+description = "Run the agentic code-gen pipeline for this issue"
+```
+
+Available placeholders, substituted from the selected issue before the command runs:
+
+| Placeholder    | Value                                  |
+|----------------|------------------------------------------|
+| `{identifier}` | Issue identifier, e.g. `SA-123`          |
+| `{title}`      | Issue title                              |
+| `{url}`        | Linear URL for the issue                 |
+| `{team}`       | Team key, e.g. `SA`                      |
+| `{project}`    | Project name (empty if none)             |
+| `{state}`      | Status name, e.g. `In Progress`          |
+| `{priority}`   | Raw priority number (0–4)                |
+| `{assignee}`   | Assignee name (empty if unassigned)      |
+
+Extensions can be triggered from the issue list or the detail view. Keys already used
+by the core UI (`q j k o r f l h c`) are reserved — any extension bound to one of those,
+or to a key another extension already claims, is skipped with a warning printed to
+stderr on startup. Bound extensions show up in the footer alongside the built-in keys.
+
+Since issue fields (like the title) are interpolated directly into a shell command
+string, only configure extensions whose commands you trust — treat `extensions.toml`
+like a script you'd run yourself.

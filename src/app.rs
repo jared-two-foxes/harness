@@ -1,3 +1,4 @@
+use crate::extensions::{Extension, ExtensionRunResult};
 use crate::linear::Issue;
 
 pub enum LoadState {
@@ -97,8 +98,16 @@ pub enum Mode {
         selected: usize,
         checked: Vec<bool>,
     },
-    /// Viewing the selected issue's full details in an overlay.
+    /// Viewing the selected issue's full details.
     Detail,
+    /// Viewing the output of a running or completed extension command.
+    ExtensionOutput {
+        name: String,
+        running: bool,
+        success: bool,
+        stdout: String,
+        stderr: String,
+    },
 }
 
 #[derive(Default)]
@@ -172,6 +181,7 @@ pub struct App {
     pub filters: Filters,
     pub sort_key: SortKey,
     pub mode: Mode,
+    pub extensions: Vec<Extension>,
 }
 
 const ALL_LABEL: &str = "(All)";
@@ -187,6 +197,7 @@ impl App {
             filters: Filters::default(),
             sort_key: SortKey::Updated,
             mode: Mode::Normal,
+            extensions: Vec::new(),
         }
     }
 
@@ -252,6 +263,41 @@ impl App {
     }
 
     pub fn close_detail(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
+    /// Looks up the extension bound to a key, if any. Usable from any mode that
+    /// allows acting on the selected issue (Normal, Detail).
+    pub fn find_extension(&self, key: char) -> Option<Extension> {
+        self.extensions.iter().find(|e| e.key == key).cloned()
+    }
+
+    pub fn start_extension(&mut self, name: String) {
+        self.mode = Mode::ExtensionOutput {
+            name,
+            running: true,
+            success: false,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+    }
+
+    pub fn finish_extension(&mut self, result: ExtensionRunResult) {
+        // Ignore results for an extension run the user has already navigated away from.
+        if let Mode::ExtensionOutput { name, running, .. } = &self.mode {
+            if *running && *name == result.name {
+                self.mode = Mode::ExtensionOutput {
+                    name: result.name,
+                    running: false,
+                    success: result.success,
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                };
+            }
+        }
+    }
+
+    pub fn close_extension_output(&mut self) {
         self.mode = Mode::Normal;
     }
 
