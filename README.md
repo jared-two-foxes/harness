@@ -17,28 +17,48 @@ cargo run
 
 ## Controls
 
+### Issue list
+
 | Key         | Action                          |
 |-------------|----------------------------------|
 | `j` / `↓`   | Move selection down              |
 | `k` / `↑`   | Move selection up                |
-| `t`         | Filter by team                   |
-| `p`         | Filter by project                |
-| `s`         | Filter by status (multi-select)  |
-| `c`         | Clear all filters                |
+| `Enter` / `l` | View selected issue's details  |
+| `f`         | Open the filters menu             |
+| `o`         | Toggle sort order (updated / priority) |
 | `r`         | Refresh issues from Linear       |
 | `q` / `Esc` | Quit                             |
 
-While a filter popup is open:
+### Detail view
 
 | Key             | Action                                  |
 |-----------------|------------------------------------------|
-| `j`/`k`         | Move cursor                              |
-| `space`         | Toggle selection (status filter only)    |
-| `Enter`         | Apply filter                             |
-| `Esc`           | Cancel without changes                   |
+| `j` / `k`       | View next / previous issue               |
+| `Esc` / `Enter` / `q` / `h` | Back to the issue list       |
+
+### Filters menu (`f`)
+
+One row per filter dimension (Team, Project, Status, Blocked), showing its current value.
+
+| Key             | Action                                  |
+|-----------------|------------------------------------------|
+| `j` / `k`       | Move cursor                              |
+| `Enter`         | Edit the highlighted filter              |
+| `c`             | Clear all filters                        |
+| `Esc`           | Close the menu                           |
+
+Editing a single filter:
+
+| Key             | Action                                                    |
+|-----------------|------------------------------------------------------------|
+| `j` / `k`       | Move cursor                                                |
+| `space`         | Toggle selection (Status only — supports multiple values)  |
+| `Enter`         | Apply and return to the filters menu                       |
+| `Esc`           | Cancel and return to the filters menu                      |
 
 ## Features
 
-- Lists all issues in the workspace, sorted by most recently updated
-- Detail pane shows team, assignee, state, priority, and a markdown-rendered description
-- Filter issues by team, project, and status (status supports selecting multiple values at once)
+- Lists all issues in the workspace, sorted by last-updated or priority
+- Full-screen detail view with team, assignee, state, priority, blocked status, and a markdown-rendered description
+- Filter issues by team, project, status (multi-select), and blocked state (any / unblocked only / blocked only), all from one consolidated filters menu
+- Blocked issues (per Linear's issue relations) are marked with a `!` in the list and called out in the detail view
