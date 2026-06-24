@@ -2,6 +2,7 @@ mod app;
 mod extensions;
 mod linear;
 mod markdown;
+mod project;
 mod ui;
 
 use std::{io::stdout, time::Duration};
@@ -47,6 +48,18 @@ async fn main() -> Result<()> {
         Err(e) => eprintln!("warning: failed to load extensions config: {e:?}"),
     }
 
+    match project::load() {
+        Ok(projects) => match std::env::current_dir() {
+            Ok(cwd) => {
+                if let Some(active) = project::find_active(&projects, &cwd) {
+                    app.set_active_project(active.clone());
+                }
+            }
+            Err(e) => eprintln!("warning: failed to determine current directory: {e:?}"),
+        },
+        Err(e) => eprintln!("warning: failed to load projects config: {e:?}"),
+    }
+
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -71,9 +84,10 @@ fn launch_extension(app: &mut App, key: char, tx: mpsc::UnboundedSender<Extensio
     let Some(issue) = app.selected_issue().cloned() else {
         return;
     };
+    let project_root = app.project_root();
     app.start_extension(extension.name.clone());
     tokio::spawn(async move {
-        let result = extensions::run(&extension, &issue).await;
+        let result = extensions::run(&extension, &issue, project_root.as_deref()).await;
         let _ = tx.send(result);
     });
 }

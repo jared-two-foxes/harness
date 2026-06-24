@@ -65,7 +65,7 @@ pub fn load() -> Result<Vec<Extension>> {
     Ok(extensions)
 }
 
-fn build_command(template: &str, issue: &Issue) -> String {
+fn build_command(template: &str, issue: &Issue, project_root: Option<&str>) -> String {
     template
         .replace("{identifier}", &issue.identifier)
         .replace("{title}", &issue.title)
@@ -81,6 +81,7 @@ fn build_command(template: &str, issue: &Issue) -> String {
             "{project}",
             issue.project.as_ref().map(|p| p.name.as_str()).unwrap_or(""),
         )
+        .replace("{project_root}", project_root.unwrap_or(""))
 }
 
 pub struct ExtensionRunResult {
@@ -91,12 +92,17 @@ pub struct ExtensionRunResult {
 }
 
 /// Runs an extension's command against the given issue, substituting `{field}`
-/// placeholders first. The command is executed through the platform shell so
+/// placeholders first (including `{project_root}`, from the active project
+/// mapping, if any). The command is executed through the platform shell so
 /// templates can use pipes, multiple args, etc. Only run extensions you wrote
 /// or trust: issue fields (e.g. title) are interpolated directly into the
 /// shell command string.
-pub async fn run(extension: &Extension, issue: &Issue) -> ExtensionRunResult {
-    let cmd_str = build_command(&extension.command, issue);
+pub async fn run(
+    extension: &Extension,
+    issue: &Issue,
+    project_root: Option<&str>,
+) -> ExtensionRunResult {
+    let cmd_str = build_command(&extension.command, issue, project_root);
 
     #[cfg(windows)]
     let mut command = {
@@ -157,8 +163,22 @@ mod tests {
 
     #[test]
     fn substitutes_placeholders() {
-        let cmd = build_command("gen --id {identifier} --title \"{title}\"", &sample_issue());
+        let cmd = build_command(
+            "gen --id {identifier} --title \"{title}\"",
+            &sample_issue(),
+            None,
+        );
         assert_eq!(cmd, "gen --id SA-1 --title \"Fix the thing\"");
+    }
+
+    #[test]
+    fn substitutes_project_root() {
+        let cmd = build_command(
+            "cd {project_root} && run {identifier}",
+            &sample_issue(),
+            Some("/repos/va"),
+        );
+        assert_eq!(cmd, "cd /repos/va && run SA-1");
     }
 
     #[tokio::test]
@@ -166,13 +186,10 @@ mod tests {
         let extension = Extension {
             key: 'g',
             name: "Echo".to_string(),
-            #[cfg(windows)]
-            command: "echo hello {identifier}".to_string(),
-            #[cfg(not(windows))]
             command: "echo hello {identifier}".to_string(),
             description: String::new(),
         };
-        let result = run(&extension, &sample_issue()).await;
+        let result = run(&extension, &sample_issue(), None).await;
         assert!(result.success);
         assert!(result.stdout.contains("hello SA-1"));
     }

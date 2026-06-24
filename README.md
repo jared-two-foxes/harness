@@ -63,6 +63,7 @@ Editing a single filter:
 - Filter issues by team, project, status (multi-select), and blocked state (any / unblocked only / blocked only), all from one consolidated filters menu
 - Blocked issues (per Linear's issue relations) are marked with a `!` in the list and called out in the detail view
 - Extensible: bind custom hotkeys to external commands (e.g. your own AI code-generation scripts) that run against the selected issue
+- Project-aware: maps a local repo path to its Linear team/project so the issue list opens pre-scoped and extension commands know which repo to run in
 
 ## Extensions
 
@@ -94,6 +95,7 @@ Available placeholders, substituted from the selected issue before the command r
 | `{state}`      | Status name, e.g. `In Progress`          |
 | `{priority}`   | Raw priority number (0–4)                |
 | `{assignee}`   | Assignee name (empty if unassigned)      |
+| `{project_root}` | Root path of the active project mapping (see below), empty if none |
 
 Extensions can be triggered from the issue list or the detail view. Keys already used
 by the core UI (`q j k o r f l h c`) are reserved — any extension bound to one of those,
@@ -103,3 +105,48 @@ stderr on startup. Bound extensions show up in the footer alongside the built-in
 Since issue fields (like the title) are interpolated directly into a shell command
 string, only configure extensions whose commands you trust — treat `extensions.toml`
 like a script you'd run yourself.
+
+## Project mapping
+
+Since harness can run from any directory but a given repo usually corresponds to one
+specific Linear team/project, you can teach it that mapping in `~/.harness/projects.toml`:
+
+```toml
+[[project]]
+path = "~/code/own/VirtualAssistant"
+team = "staging_assistant"
+project = "backend"
+```
+
+`path` supports `~` for the home directory. At startup harness checks the current
+working directory against every configured `path` (longest/most specific match wins)
+and, if one matches:
+
+- defaults the issue list's Team and Project filters to that mapping (still
+  overridable afterwards via the filters menu — this is just the starting point,
+  and it's reapplied on every `r` refresh)
+- exposes the matched path to extensions as `{project_root}`, so a command like
+  `cd /d "{project_root}" && python script.py {identifier}` runs against the right repo
+  regardless of where harness itself was launched from
+
+With no match (or no `projects.toml`), harness just shows every issue, unfiltered, as before.
+
+### Example: binding the `check-ticket` / `resolve-ticket` pipeline scripts
+
+Given Python scripts that expect to run with the target repo as their working
+directory (e.g. they read/write `.gap-plan.md`, `.ticket.md` etc. relative to `cwd`),
+`~/.harness/extensions.toml` can bind them like this:
+
+```toml
+[[extension]]
+key = "x"
+name = "Check ticket"
+description = "Plan + report remaining acceptance criteria for this ticket"
+command = 'cd /d "{project_root}" && python "C:/path/to/bin/check-ticket.py" {identifier}'
+
+[[extension]]
+key = "g"
+name = "Resolve ticket"
+description = "Run the TDD pipeline to implement this ticket's remaining criteria"
+command = 'cd /d "{project_root}" && python "C:/path/to/bin/resolve-ticket.py" {identifier}'
+```

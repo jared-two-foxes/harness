@@ -1,5 +1,6 @@
 use crate::extensions::{Extension, ExtensionRunResult};
 use crate::linear::Issue;
+use crate::project::Project;
 
 pub enum LoadState {
     Loading,
@@ -182,6 +183,7 @@ pub struct App {
     pub sort_key: SortKey,
     pub mode: Mode,
     pub extensions: Vec<Extension>,
+    pub active_project: Option<Project>,
 }
 
 const ALL_LABEL: &str = "(All)";
@@ -198,12 +200,39 @@ impl App {
             sort_key: SortKey::Updated,
             mode: Mode::Normal,
             extensions: Vec::new(),
+            active_project: None,
         }
+    }
+
+    /// Sets the active project mapping and defaults the team/project filters
+    /// to it, so the issue list opens already scoped to the right Linear
+    /// team/project for the repo harness was launched from. Still
+    /// user-overridable afterwards via the filters menu.
+    pub fn set_active_project(&mut self, project: Project) {
+        self.filters.team = Some(project.team.clone());
+        self.filters.project = Some(project.project.clone());
+        self.active_project = Some(project);
+        self.apply_filters();
+    }
+
+    /// The active project's root path, for the `{project_root}` extension
+    /// placeholder. `None` when harness wasn't launched inside a mapped repo.
+    pub fn project_root(&self) -> Option<String> {
+        self.active_project
+            .as_ref()
+            .map(|p| p.root().display().to_string())
     }
 
     pub fn set_issues(&mut self, issues: Vec<Issue>) {
         self.all_issues = issues;
         self.filters.clear();
+        // Re-scope to the active project's team/project on every (re)load,
+        // including refreshes, since that default isn't something a refresh
+        // should silently drop.
+        if let Some(project) = &self.active_project {
+            self.filters.team = Some(project.team.clone());
+            self.filters.project = Some(project.project.clone());
+        }
         self.load_state = LoadState::Loaded;
         self.apply_filters();
     }
