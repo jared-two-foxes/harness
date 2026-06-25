@@ -1,11 +1,15 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::linear::Issue;
 
 /// Keys already used by the core UI; extensions configured to use these are skipped.
-const RESERVED_KEYS: &[char] = &['q', 'j', 'k', 'o', 'r', 'f', 'l', 'h', 'c'];
+const RESERVED_KEYS: &[char] = &[
+    'q', 'j', 'k', 'o', 'r', 'f', 'l', 'h', 'c', 'd', 'u', 'g', 'G', 'K',
+];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Extension {
@@ -84,11 +88,10 @@ fn build_command(template: &str, issue: &Issue, project_root: Option<&str>) -> S
         .replace("{project_root}", project_root.unwrap_or(""))
 }
 
-pub struct ExtensionRunResult {
-    pub name: String,
-    pub success: bool,
-    pub stdout: String,
-    pub stderr: String,
+/// One line of output as it arrives, or the run's final outcome.
+pub enum ExtensionEvent {
+    Line { name: String, stderr: bool, text: String },
+    Done { name: String, success: bool },
 }
 
 /// Runs an extension's command against the given issue, substituting `{field}`
@@ -97,12 +100,21 @@ pub struct ExtensionRunResult {
 /// templates can use pipes, multiple args, etc. Only run extensions you wrote
 /// or trust: issue fields (e.g. title) are interpolated directly into the
 /// shell command string.
+///
+/// Output is streamed line-by-line over `tx` as it's produced, rather than
+/// buffered until exit — important for long-running AI pipeline scripts,
+/// where otherwise the UI would show nothing at all until the whole thing
+/// finished. `cancel` lets the caller kill the child process early; either
+/// way, exactly one `Done` event is sent once the process exits or is killed.
 pub async fn run(
-    extension: &Extension,
-    issue: &Issue,
-    project_root: Option<&str>,
-) -> ExtensionRunResult {
-    let cmd_str = build_command(&extension.command, issue, project_root);
+    extension: Extension,
+    issue: Issue,
+    project_root: Option<String>,
+    tx: mpsc::UnboundedSender<ExtensionEvent>,
+    mut cancel: oneshot::Receiver<()>,
+) {
+    let name = extension.name.clone();
+    let cmd_str = build_command(&extension.command, &issue, project_root.as_deref());
 
     // On Windows, `arg()` would quote the whole command string as a single
     // CreateProcess argument (since it contains spaces), and that extra
@@ -117,27 +129,102 @@ pub async fn run(
         c.raw_arg("/C").raw_arg(&cmd_str);
         c
     };
+    // Run in its own process group so `kill_tree` can reach the whole tree
+    // (the real work is a grandchild of this `sh -c`) via a negative PID,
+    // rather than just this directly-tracked shell process.
     #[cfg(not(windows))]
     let mut command = {
         let mut c = tokio::process::Command::new("sh");
         c.arg("-c").arg(&cmd_str);
+        c.process_group(0);
         c
     };
 
-    match command.output().await {
-        Ok(output) => ExtensionRunResult {
-            name: extension.name.clone(),
-            success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        },
-        Err(e) => ExtensionRunResult {
-            name: extension.name.clone(),
-            success: false,
-            stdout: String::new(),
-            stderr: format!("failed to launch command: {e}"),
-        },
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(ExtensionEvent::Line {
+                name: name.clone(),
+                stderr: true,
+                text: format!("failed to launch command: {e}"),
+            });
+            let _ = tx.send(ExtensionEvent::Done { name, success: false });
+            return;
+        }
+    };
+
+    let mut stdout_lines = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
+    let mut stderr_lines = BufReader::new(child.stderr.take().expect("piped stderr")).lines();
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+
+    let success = loop {
+        tokio::select! {
+            line = stdout_lines.next_line(), if !stdout_done => {
+                match line {
+                    Ok(Some(text)) => {
+                        let _ = tx.send(ExtensionEvent::Line { name: name.clone(), stderr: false, text });
+                    }
+                    _ => stdout_done = true,
+                }
+            }
+            line = stderr_lines.next_line(), if !stderr_done => {
+                match line {
+                    Ok(Some(text)) => {
+                        let _ = tx.send(ExtensionEvent::Line { name: name.clone(), stderr: true, text });
+                    }
+                    _ => stderr_done = true,
+                }
+            }
+            status = child.wait() => {
+                break status.map(|s| s.success()).unwrap_or(false);
+            }
+            _ = &mut cancel => {
+                kill_tree(&mut child).await;
+                let _ = tx.send(ExtensionEvent::Line {
+                    name: name.clone(),
+                    stderr: true,
+                    text: "(cancelled by user)".to_string(),
+                });
+                break false;
+            }
+        }
+    };
+
+    let _ = tx.send(ExtensionEvent::Done { name, success });
+}
+
+/// Kills `child` and its descendants. The tracked child is always `cmd /C`
+/// (Windows) or `sh -c` (Unix) wrapping the real command, so the actual
+/// work (e.g. a Python script, and anything *it* spawns) runs as a
+/// grandchild — killing just the tracked process leaves it running. On
+/// Windows, `taskkill /T` kills the whole tree by PID; on Unix the child
+/// runs in its own process group (see `process_group(0)` below) so a
+/// negative-PID `kill` reaches the whole group.
+async fn kill_tree(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        #[cfg(windows)]
+        {
+            let _ = tokio::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .output()
+                .await;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = tokio::process::Command::new("kill")
+                .args(["-9", &format!("-{pid}")])
+                .output()
+                .await;
+        }
     }
+    // Reap the tracked child and make sure it's gone even if the above failed
+    // (e.g. it had already exited on its own).
+    let _ = child.kill().await;
 }
 
 #[cfg(test)]
@@ -188,17 +275,35 @@ mod tests {
         assert_eq!(cmd, "cd /repos/va && run SA-1");
     }
 
+    /// Drives `run()` to completion and collects every event it sent, for
+    /// tests that don't care about interleaving with other UI activity.
+    async fn run_and_collect(extension: Extension, issue: Issue) -> (Vec<String>, bool) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        run(extension, issue, None, tx, cancel_rx).await;
+
+        let mut lines = Vec::new();
+        let mut success = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                ExtensionEvent::Line { text, .. } => lines.push(text),
+                ExtensionEvent::Done { success: s, .. } => success = s,
+            }
+        }
+        (lines, success)
+    }
+
     #[tokio::test]
-    async fn runs_command_and_captures_stdout() {
+    async fn runs_command_and_streams_stdout() {
         let extension = Extension {
             key: 'g',
             name: "Echo".to_string(),
             command: "echo hello {identifier}".to_string(),
             description: String::new(),
         };
-        let result = run(&extension, &sample_issue(), None).await;
-        assert!(result.success);
-        assert!(result.stdout.contains("hello SA-1"));
+        let (lines, success) = run_and_collect(extension, sample_issue()).await;
+        assert!(success);
+        assert!(lines.iter().any(|l| l.contains("hello SA-1")));
     }
 
     /// Regression test: a command with `cd` into a quoted path plus other
@@ -216,13 +321,55 @@ mod tests {
             command: format!(r#"cd /d "{}" && echo ok {{identifier}}"#, dir_str),
             description: String::new(),
         };
-        let result = run(&extension, &sample_issue(), None).await;
+        let (lines, success) = run_and_collect(extension, sample_issue()).await;
+        assert!(success, "lines={lines:?}");
+        assert!(lines.iter().any(|l| l.contains("ok SA-1")));
+    }
+
+    #[tokio::test]
+    async fn cancelling_kills_the_process_and_reports_failure() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+
+        // A command that would run far longer than the test should wait.
+        #[cfg(windows)]
+        let command = "ping -n 30 127.0.0.1 >NUL".to_string();
+        #[cfg(not(windows))]
+        let command = "sleep 30".to_string();
+
+        let extension = Extension {
+            key: 'g',
+            name: "Slow".to_string(),
+            command,
+            description: String::new(),
+        };
+
+        let t0 = std::time::Instant::now();
+        let handle = tokio::spawn(run(extension, sample_issue(), None, tx, cancel_rx));
+        // Give the process a moment to actually start before killing it.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let _ = cancel_tx.send(());
+        handle.await.expect("run task should not panic");
+
+        // Regression check: an earlier version of `kill_tree` only killed the
+        // directly-tracked `cmd /C` / `sh -c` process, leaving the real
+        // grandchild (here, `ping`/`sleep`) running for its full 30s — which
+        // also meant a real extension's actual script kept running after
+        // "kill" was pressed. `kill_tree` killing the whole tree should let
+        // this finish in well under a second.
         assert!(
-            result.success,
-            "stdout={:?} stderr={:?}",
-            result.stdout, result.stderr
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "cancelling took {:?} — the process tree likely wasn't fully killed",
+            t0.elapsed()
         );
-        assert!(result.stdout.contains("ok SA-1"));
+
+        let mut success = true;
+        while let Ok(event) = rx.try_recv() {
+            if let ExtensionEvent::Done { success: s, .. } = event {
+                success = s;
+            }
+        }
+        assert!(!success, "a cancelled run should report failure");
     }
 
     #[test]
@@ -236,13 +383,13 @@ mod tests {
                     description: String::new(),
                 },
                 Extension {
-                    key: 'g',
+                    key: 'x',
                     name: "Good".to_string(),
                     command: "echo".to_string(),
                     description: String::new(),
                 },
                 Extension {
-                    key: 'g',
+                    key: 'x',
                     name: "Dup".to_string(),
                     command: "echo".to_string(),
                     description: String::new(),

@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 
@@ -177,17 +177,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         }
         LoadState::Loaded => match &app.mode {
             Mode::Detail => draw_detail_view(frame, app, area),
-            Mode::ExtensionOutput {
-                name,
-                running,
-                success,
-                stdout,
-                stderr,
-                scroll,
-                ..
-            } => draw_extension_output(
-                frame, area, name, *running, *success, stdout, stderr, *scroll,
-            ),
+            Mode::ExtensionOutput { scroll } => draw_extension_output(frame, area, app, *scroll),
             _ => draw_issue_list(frame, app, area),
         },
     }
@@ -234,14 +224,25 @@ fn draw_issue_list(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
     }
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
-    frame.render_widget(list, area);
+    let block = Block::default().borders(Borders::ALL).title(title);
+
+    if items.is_empty() {
+        let p = Paragraph::new("No issues match the current filters.")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(block);
+        frame.render_widget(p, area);
+        return;
+    }
+
+    let list = List::new(items).block(block);
+    let mut state = ListState::default().with_selected(Some(app.selected));
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_detail_view(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Details (esc: back to list)");
+        .title("Details (j/k: scroll, esc: back to list)");
 
     let Some(issue) = app.selected_issue() else {
         frame.render_widget(Paragraph::new("No issue selected").block(block), area);
@@ -310,30 +311,32 @@ fn draw_detail_view(frame: &mut Frame, app: &App, area: Rect) {
         lines.extend(crate::markdown::render(desc));
     }
 
-    let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let p = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((app.detail_scroll, 0));
     frame.render_widget(p, area);
 }
 
-fn draw_extension_output(
-    frame: &mut Frame,
-    area: Rect,
-    name: &str,
-    running: bool,
-    success: bool,
-    stdout: &str,
-    stderr: &str,
-    scroll: u16,
-) {
-    let title = if running {
-        format!("Running: {name}...")
-    } else if success {
-        format!("{name} (done) — line {}", scroll + 1)
-    } else {
-        format!("{name} (failed) — line {}", scroll + 1)
+fn draw_extension_output(frame: &mut Frame, area: Rect, app: &App, scroll: u16) {
+    let Some(run) = &app.extension_run else {
+        frame.render_widget(
+            Paragraph::new("No extension output").block(Block::default().borders(Borders::ALL)),
+            area,
+        );
+        return;
     };
-    let title_style = if running {
+
+    let title = if run.running {
+        format!("Running: {}... (K: kill)", run.name)
+    } else if run.success {
+        format!("{} (done) — line {}", run.name, scroll + 1)
+    } else {
+        format!("{} (failed) — line {}", run.name, scroll + 1)
+    };
+    let title_style = if run.running {
         Style::default().fg(Color::Yellow)
-    } else if success {
+    } else if run.success {
         Style::default().fg(Color::Green)
     } else {
         Style::default().fg(Color::Red)
@@ -343,37 +346,25 @@ fn draw_extension_output(
         .borders(Borders::ALL)
         .title(Span::styled(title, title_style.add_modifier(Modifier::BOLD)));
 
-    let mut lines = Vec::new();
-    if running {
-        lines.push(Line::raw("Command is running..."));
-    } else {
-        if !stdout.is_empty() {
-            lines.push(Line::styled(
-                "stdout:",
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            lines.extend(stdout.lines().map(|l| Line::raw(l.to_string())));
-        }
-        if !stderr.is_empty() {
-            if !lines.is_empty() {
-                lines.push(Line::raw(""));
+    let mut lines: Vec<Line> = run
+        .lines
+        .iter()
+        .map(|(is_stderr, text)| {
+            if *is_stderr {
+                Line::styled(text.clone(), Style::default().fg(Color::Red))
+            } else {
+                Line::raw(text.clone())
             }
-            lines.push(Line::styled(
-                "stderr:",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ));
-            lines.extend(
-                stderr
-                    .lines()
-                    .map(|l| Line::styled(l.to_string(), Style::default().fg(Color::Red))),
-            );
-        }
-        if stdout.is_empty() && stderr.is_empty() {
-            lines.push(Line::styled(
-                "(no output)",
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
+        })
+        .collect();
+
+    if lines.is_empty() {
+        let text = if run.running {
+            "Waiting for output..."
+        } else {
+            "(no output)"
+        };
+        lines.push(Line::styled(text, Style::default().fg(Color::DarkGray)));
     }
 
     let p = Paragraph::new(lines)
@@ -403,9 +394,18 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             "j/k: navigate   enter: view details   f: filters   o: sort   r: refresh   q: quit"
                 .to_string()
         }
-        Mode::Detail => "j/k: next/prev issue   esc: back to list".to_string(),
-        Mode::ExtensionOutput { .. } => {
+        Mode::Detail => {
             "j/k: scroll   u/d: page up/down   g/G: top/bottom   esc: back to list".to_string()
+        }
+        Mode::ExtensionOutput { .. } => {
+            let running = app.extension_run.as_ref().is_some_and(|r| r.running);
+            if running {
+                "j/k: scroll   u/d: page up/down   g/G: top/bottom   K: kill   esc: back to list"
+                    .to_string()
+            } else {
+                "j/k: scroll   u/d: page up/down   g/G: top/bottom   esc: back to list"
+                    .to_string()
+            }
         }
         Mode::FilterMenu { .. } => {
             "j/k: navigate   enter: edit   c: clear all   esc: close".to_string()
@@ -416,12 +416,18 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Filter { .. } => "j/k: navigate   enter: select   esc: back".to_string(),
     };
 
-    let hints = extension_hints(app);
-    let text = if matches!(app.mode, Mode::Normal | Mode::Detail) && !hints.is_empty() {
-        format!("{base}   |   {hints}")
-    } else {
-        base
-    };
+    let mut text = base;
+    if matches!(app.mode, Mode::Normal | Mode::Detail) {
+        if let Some(run) = &app.extension_run {
+            if run.running {
+                text.push_str(&format!("   |   ● {} running...", run.name));
+            }
+        }
+        let hints = extension_hints(app);
+        if !hints.is_empty() {
+            text.push_str(&format!("   |   {hints}"));
+        }
+    }
 
     let p = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(p, area);

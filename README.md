@@ -33,19 +33,23 @@ cargo run
 
 | Key             | Action                                  |
 |-----------------|------------------------------------------|
-| `j` / `k`       | View next / previous issue               |
+| `j` / `k`       | Scroll one line                          |
+| `u` / `d` / `PageUp` / `PageDown` | Scroll one page         |
+| `g` / `G`       | Jump to top / bottom                     |
 | `Esc` / `Enter` / `q` / `h` | Back to the issue list       |
 
 ### Extension output view
 
-Shown after triggering an extension (see below) — displays its stdout/stderr.
+Shown after triggering an extension (see below) — displays its output as it streams
+in, live, rather than only once the command finishes.
 
 | Key             | Action                                  |
 |-----------------|------------------------------------------|
 | `j` / `k`       | Scroll one line                          |
 | `u` / `d` / `PageUp` / `PageDown` | Scroll one page         |
 | `g` / `G`       | Jump to top / bottom                     |
-| `Esc` / `q`     | Back to the issue list                   |
+| `K`             | Kill the running command (while it's still running) |
+| `Esc` / `q`     | Back to the issue list — the command (if still running) keeps going in the background; reopen with the same extension key, or any extension key, to see it again |
 
 ### Filters menu (`f`)
 
@@ -82,7 +86,15 @@ Extensions let you bind a key to an external command that runs against the curre
 selected issue — e.g. an `agentic` code-gen script that takes an issue identifier and
 title and goes off to generate a PR. Harness shells out via `process::Command`
 (`cmd /C` on Windows, `sh -c` elsewhere) and runs the command in the background so the
-UI stays responsive; the captured stdout/stderr is shown in a results view when it's done.
+UI stays responsive. Output streams into the output view line-by-line as it's produced
+(not just dumped once the whole thing exits), and the run keeps going even if you back
+out of that view — reopen it any time via the same (or any) extension key. Only one
+extension can run at a time, since extensions like check-ticket/resolve-ticket mutate
+shared state files in the target repo; triggering a key while one is already running
+just reopens its output instead of starting a second one. Press `K` while viewing a
+running command's output to kill it (and everything it spawned, not just the
+directly-launched shell — e.g. on Windows this uses `taskkill /T` to take down the
+whole process tree, since the real work is usually a grandchild of the `cmd /C` shell).
 
 Define extensions in `~/.harness/extensions.toml`:
 
@@ -109,9 +121,11 @@ Available placeholders, substituted from the selected issue before the command r
 | `{project_root}` | Root path of the active project mapping (see below), empty if none |
 
 Extensions can be triggered from the issue list or the detail view. Keys already used
-by the core UI (`q j k o r f l h c`) are reserved — any extension bound to one of those,
-or to a key another extension already claims, is skipped with a warning printed to
-stderr on startup. Bound extensions show up in the footer alongside the built-in keys.
+by the core UI (`q j k o r f l h c d u g G K`) are reserved — any extension bound to one
+of those, or to a key another extension already claims, is skipped with a warning
+printed to stderr on startup. Bound extensions show up in the footer alongside the
+built-in keys, and whenever one is running you'll see a `● <name> running...` indicator
+in the footer even while browsing the list or detail view.
 
 Since issue fields (like the title) are interpolated directly into a shell command
 string, only configure extensions whose commands you trust — treat `extensions.toml`

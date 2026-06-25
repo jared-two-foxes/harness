@@ -14,10 +14,10 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use app::{App, Mode};
-use extensions::ExtensionRunResult;
+use extensions::ExtensionEvent;
 use linear::Client;
 
 fn load_api_key() -> Result<String> {
@@ -75,21 +75,27 @@ async fn main() -> Result<()> {
     result
 }
 
-/// Spawns the extension's command in the background and routes its result
-/// back through `tx` once it finishes, without blocking the UI loop.
-fn launch_extension(app: &mut App, key: char, tx: mpsc::UnboundedSender<ExtensionRunResult>) {
+/// Triggers the extension bound to `key`, if any. If one is already running,
+/// just reopens its (still-updating) output view instead of starting a
+/// second concurrent run — important for scripts like check-ticket.py /
+/// resolve-ticket.py that mutate shared state files in the target repo.
+/// Otherwise spawns the command in the background and streams its output
+/// back through `tx` without blocking the UI loop.
+fn launch_extension(app: &mut App, key: char, tx: mpsc::UnboundedSender<ExtensionEvent>) {
     let Some(extension) = app.find_extension(key) else {
         return;
     };
+    if app.extension_running() {
+        app.show_extension_output();
+        return;
+    }
     let Some(issue) = app.selected_issue().cloned() else {
         return;
     };
     let project_root = app.project_root();
-    app.start_extension(extension.name.clone());
-    tokio::spawn(async move {
-        let result = extensions::run(&extension, &issue, project_root.as_deref()).await;
-        let _ = tx.send(result);
-    });
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    app.start_extension(extension.name.clone(), cancel_tx);
+    tokio::spawn(extensions::run(extension, issue, project_root, tx, cancel_rx));
 }
 
 async fn run(
@@ -97,13 +103,21 @@ async fn run(
     app: &mut App,
     client: &Client,
 ) -> Result<()> {
-    let (ext_tx, mut ext_rx) = mpsc::unbounded_channel::<ExtensionRunResult>();
+    let (ext_tx, mut ext_rx) = mpsc::unbounded_channel::<ExtensionEvent>();
 
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, app))?;
 
-        while let Ok(result) = ext_rx.try_recv() {
-            app.finish_extension(result);
+        // Drained every tick regardless of which mode/screen is active, so
+        // a script's output is never lost just because the user navigated
+        // away from its output view while it was still running.
+        while let Ok(event) = ext_rx.try_recv() {
+            match event {
+                ExtensionEvent::Line { name, stderr, text } => {
+                    app.push_extension_line(&name, stderr, text)
+                }
+                ExtensionEvent::Done { name, success } => app.finish_extension_run(&name, success),
+            }
         }
 
         if event::poll(Duration::from_millis(200))? {
@@ -128,13 +142,18 @@ async fn run(
                             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('h') => {
                                 app.close_detail()
                             }
-                            KeyCode::Char('j') | KeyCode::Down => app.select_next(),
-                            KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
+                            KeyCode::Char('j') | KeyCode::Down => app.scroll_detail(1),
+                            KeyCode::Char('k') | KeyCode::Up => app.scroll_detail(-1),
+                            KeyCode::PageDown | KeyCode::Char('d') => app.scroll_detail(10),
+                            KeyCode::PageUp | KeyCode::Char('u') => app.scroll_detail(-10),
+                            KeyCode::Char('g') => app.scroll_detail(i32::MIN),
+                            KeyCode::Char('G') => app.scroll_detail(i32::MAX),
                             KeyCode::Char(c) => launch_extension(app, c, ext_tx.clone()),
                             _ => {}
                         },
                         Mode::ExtensionOutput { .. } => match key.code {
                             KeyCode::Esc | KeyCode::Char('q') => app.close_extension_output(),
+                            KeyCode::Char('K') => app.cancel_running_extension(),
                             KeyCode::Char('j') | KeyCode::Down => app.scroll_extension_output(1),
                             KeyCode::Char('k') | KeyCode::Up => app.scroll_extension_output(-1),
                             KeyCode::PageDown | KeyCode::Char('d') => {

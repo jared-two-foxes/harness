@@ -1,4 +1,6 @@
-use crate::extensions::{Extension, ExtensionRunResult};
+use tokio::sync::oneshot;
+
+use crate::extensions::Extension;
 use crate::linear::Issue;
 use crate::project::Project;
 
@@ -101,18 +103,27 @@ pub enum Mode {
     },
     /// Viewing the selected issue's full details.
     Detail,
-    /// Viewing the output of a running or completed extension command.
+    /// Viewing the output of a running or completed extension command. The
+    /// run itself lives in `App::extension_run`, independent of this mode,
+    /// so navigating away (and back via `show_extension_output`) doesn't
+    /// lose anything that arrives in the meantime.
     ExtensionOutput {
-        name: String,
-        running: bool,
-        success: bool,
-        stdout: String,
-        stderr: String,
         /// Current scroll offset (in lines) into the rendered output.
         scroll: u16,
-        /// Total rendered line count, for clamping `scroll`.
-        line_count: u16,
     },
+}
+
+/// A single extension invocation's lifecycle: lines accumulate as they
+/// arrive from the child process's stdout/stderr, independent of whether the
+/// output view is currently on screen, so results are never silently lost by
+/// navigating away mid-run. `cancel` sends a kill signal to the running
+/// process when present (i.e. while still running).
+pub struct ExtensionRun {
+    pub name: String,
+    pub running: bool,
+    pub success: bool,
+    pub lines: Vec<(bool /* is_stderr */, String)>,
+    cancel: Option<oneshot::Sender<()>>,
 }
 
 #[derive(Default)]
@@ -188,27 +199,21 @@ pub struct App {
     pub mode: Mode,
     pub extensions: Vec<Extension>,
     pub active_project: Option<Project>,
+    pub detail_scroll: u16,
+    pub extension_run: Option<ExtensionRun>,
 }
 
 const ALL_LABEL: &str = "(All)";
 
-/// Mirrors the line count `ui::draw_extension_output` renders, so scroll can
-/// be clamped without the UI layer having to report it back.
-fn output_line_count(stdout: &str, stderr: &str) -> u16 {
-    let mut total = 0u16;
-    if !stdout.is_empty() {
-        total += 1 + stdout.lines().count() as u16;
+/// Fixed metadata line count rendered above the description in the detail view.
+const DETAIL_HEADER_LINES: u16 = 10;
+
+/// Approximate total rendered line count for the detail view (see `scroll_detail`).
+fn detail_line_count(issue: &Issue) -> u16 {
+    match &issue.description {
+        Some(d) if !d.is_empty() => DETAIL_HEADER_LINES + 2 + d.lines().count() as u16,
+        _ => DETAIL_HEADER_LINES,
     }
-    if !stderr.is_empty() {
-        if total > 0 {
-            total += 1;
-        }
-        total += 1 + stderr.lines().count() as u16;
-    }
-    if stdout.is_empty() && stderr.is_empty() {
-        total += 1;
-    }
-    total
 }
 
 impl App {
@@ -224,6 +229,8 @@ impl App {
             mode: Mode::Normal,
             extensions: Vec::new(),
             active_project: None,
+            detail_scroll: 0,
+            extension_run: None,
         }
     }
 
@@ -311,11 +318,25 @@ impl App {
     pub fn open_detail(&mut self) {
         if self.selected_issue().is_some() {
             self.mode = Mode::Detail;
+            self.detail_scroll = 0;
         }
     }
 
     pub fn close_detail(&mut self) {
         self.mode = Mode::Normal;
+    }
+
+    /// Scrolls the detail view by `delta` lines (negative scrolls up), clamped
+    /// to an approximate line count for the selected issue's content (header
+    /// fields plus its rendered description, ignoring wrap — generous enough
+    /// to avoid scrolling wildly past the end without needing the UI layer's
+    /// exact wrapped line count).
+    pub fn scroll_detail(&mut self, delta: i32) {
+        if !matches!(self.mode, Mode::Detail) {
+            return;
+        }
+        let max = self.selected_issue().map(detail_line_count).unwrap_or(0) as i64;
+        self.detail_scroll = (self.detail_scroll as i64 + delta as i64).clamp(0, max) as u16;
     }
 
     /// Looks up the extension bound to a key, if any. Usable from any mode that
@@ -324,54 +345,84 @@ impl App {
         self.extensions.iter().find(|e| e.key == key).cloned()
     }
 
-    pub fn start_extension(&mut self, name: String) {
-        self.mode = Mode::ExtensionOutput {
+    /// True while an extension command is still running in the background,
+    /// regardless of whether its output view is the one currently on screen.
+    pub fn extension_running(&self) -> bool {
+        self.extension_run.as_ref().is_some_and(|r| r.running)
+    }
+
+    /// Starts tracking a new extension run and switches to its output view.
+    /// Replaces any previous (necessarily finished — see `extension_running`)
+    /// run's record.
+    pub fn start_extension(&mut self, name: String, cancel: oneshot::Sender<()>) {
+        self.extension_run = Some(ExtensionRun {
             name,
             running: true,
             success: false,
-            stdout: String::new(),
-            stderr: String::new(),
-            scroll: 0,
-            line_count: 0,
-        };
+            lines: Vec::new(),
+            cancel: Some(cancel),
+        });
+        self.show_extension_output();
     }
 
-    pub fn finish_extension(&mut self, result: ExtensionRunResult) {
-        // Ignore results for an extension run the user has already navigated away from.
-        if let Mode::ExtensionOutput { name, running, .. } = &self.mode {
-            if *running && *name == result.name {
-                let line_count = output_line_count(&result.stdout, &result.stderr);
-                self.mode = Mode::ExtensionOutput {
-                    name: result.name,
-                    running: false,
-                    success: result.success,
-                    stdout: result.stdout,
-                    stderr: result.stderr,
-                    scroll: 0,
-                    line_count,
-                };
+    /// Switches to the extension output view without starting a new run —
+    /// used both right after starting one and to return to an in-progress
+    /// or already-finished run's output after navigating away.
+    pub fn show_extension_output(&mut self) {
+        self.mode = Mode::ExtensionOutput { scroll: 0 };
+    }
+
+    /// Appends one line of output from the named run, if it's still the
+    /// current one (defensive: in practice only one run exists at a time).
+    pub fn push_extension_line(&mut self, name: &str, is_stderr: bool, text: String) {
+        if let Some(run) = &mut self.extension_run {
+            if run.name == name {
+                run.lines.push((is_stderr, text));
             }
         }
     }
 
+    /// Marks the named run finished, if it's still the current one.
+    pub fn finish_extension_run(&mut self, name: &str, success: bool) {
+        if let Some(run) = &mut self.extension_run {
+            if run.name == name {
+                run.running = false;
+                run.success = success;
+                run.cancel = None;
+            }
+        }
+    }
+
+    /// Sends a kill signal to the currently running extension, if any.
+    pub fn cancel_running_extension(&mut self) {
+        if let Some(run) = &mut self.extension_run {
+            if let Some(cancel) = run.cancel.take() {
+                let _ = cancel.send(());
+            }
+        }
+    }
+
+    /// Just hides the output view — the run (if still going) keeps going in
+    /// the background and can be reopened with `show_extension_output`.
     pub fn close_extension_output(&mut self) {
         self.mode = Mode::Normal;
     }
 
-    /// Scrolls the extension output view by `delta` lines (negative scrolls up),
-    /// clamped to the rendered content's line count.
+    /// Scrolls the extension output view by `delta` lines (negative scrolls
+    /// up), clamped to the current line count. Allowed while running too,
+    /// since output accumulates live and the user may want to scroll back
+    /// through earlier lines without waiting for completion.
     pub fn scroll_extension_output(&mut self, delta: i32) {
-        if let Mode::ExtensionOutput {
-            running,
-            scroll,
-            line_count,
-            ..
-        } = &mut self.mode
-        {
-            if !*running {
-                let max = *line_count as i64;
-                *scroll = (*scroll as i64 + delta as i64).clamp(0, max) as u16;
-            }
+        if !matches!(self.mode, Mode::ExtensionOutput { .. }) {
+            return;
+        }
+        let max = self
+            .extension_run
+            .as_ref()
+            .map(|r| r.lines.len())
+            .unwrap_or(0) as i64;
+        if let Mode::ExtensionOutput { scroll } = &mut self.mode {
+            *scroll = (*scroll as i64 + delta as i64).clamp(0, max) as u16;
         }
     }
 
@@ -549,52 +600,70 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extensions::ExtensionRunResult;
 
-    fn finished_output(stdout: &str, stderr: &str) -> App {
+    fn app_with_lines(lines: &[&str]) -> App {
         let mut app = App::new();
-        app.start_extension("Test".to_string());
-        app.finish_extension(ExtensionRunResult {
-            name: "Test".to_string(),
-            success: true,
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-        });
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        app.start_extension("Test".to_string(), cancel_tx);
+        for line in lines {
+            app.push_extension_line("Test", false, line.to_string());
+        }
+        app.finish_extension_run("Test", true);
         app
+    }
+
+    fn scroll(app: &App) -> u16 {
+        match app.mode {
+            Mode::ExtensionOutput { scroll } => scroll,
+            _ => panic!("expected ExtensionOutput mode"),
+        }
     }
 
     #[test]
     fn scroll_clamps_to_zero_minimum() {
-        let mut app = finished_output("line1\nline2\nline3", "");
+        let mut app = app_with_lines(&["line1", "line2", "line3"]);
         app.scroll_extension_output(-100);
-        let Mode::ExtensionOutput { scroll, .. } = app.mode else {
-            panic!("expected ExtensionOutput mode");
-        };
-        assert_eq!(scroll, 0);
+        assert_eq!(scroll(&app), 0);
     }
 
     #[test]
     fn scroll_clamps_to_line_count_maximum() {
-        let mut app = finished_output("line1\nline2\nline3", "");
+        let mut app = app_with_lines(&["line1", "line2", "line3"]);
         app.scroll_extension_output(i32::MAX);
-        let Mode::ExtensionOutput {
-            scroll, line_count, ..
-        } = app.mode
-        else {
-            panic!("expected ExtensionOutput mode");
-        };
-        assert_eq!(scroll, line_count);
-        assert!(scroll > 0);
+        assert_eq!(scroll(&app), 3);
     }
 
     #[test]
-    fn scroll_does_nothing_while_running() {
+    fn scroll_works_while_running_against_lines_so_far() {
         let mut app = App::new();
-        app.start_extension("Test".to_string());
-        app.scroll_extension_output(5);
-        let Mode::ExtensionOutput { scroll, .. } = app.mode else {
-            panic!("expected ExtensionOutput mode");
-        };
-        assert_eq!(scroll, 0);
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        app.start_extension("Test".to_string(), cancel_tx);
+        app.push_extension_line("Test", false, "line1".to_string());
+        app.push_extension_line("Test", false, "line2".to_string());
+        app.scroll_extension_output(100);
+        assert_eq!(scroll(&app), 2);
+        assert!(app.extension_running());
+    }
+
+    #[test]
+    fn reopening_output_view_does_not_lose_accumulated_lines() {
+        let mut app = app_with_lines(&["line1", "line2"]);
+        app.close_extension_output();
+        assert!(matches!(app.mode, Mode::Normal));
+        app.show_extension_output();
+        let run = app.extension_run.as_ref().expect("run should persist");
+        assert_eq!(run.lines.len(), 2);
+        assert!(!run.running);
+    }
+
+    #[test]
+    fn cancelling_sends_signal_and_clears_handle() {
+        let mut app = App::new();
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        app.start_extension("Test".to_string(), cancel_tx);
+        app.cancel_running_extension();
+        assert!(cancel_rx.try_recv().is_ok());
+        // Calling again is a no-op (handle already consumed), not a panic.
+        app.cancel_running_extension();
     }
 }
