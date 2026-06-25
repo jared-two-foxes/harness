@@ -36,6 +36,17 @@ cargo run
 | `j` / `k`       | View next / previous issue               |
 | `Esc` / `Enter` / `q` / `h` | Back to the issue list       |
 
+### Extension output view
+
+Shown after triggering an extension (see below) — displays its stdout/stderr.
+
+| Key             | Action                                  |
+|-----------------|------------------------------------------|
+| `j` / `k`       | Scroll one line                          |
+| `u` / `d` / `PageUp` / `PageDown` | Scroll one page         |
+| `g` / `G`       | Jump to top / bottom                     |
+| `Esc` / `q`     | Back to the issue list                   |
+
 ### Filters menu (`f`)
 
 One row per filter dimension (Team, Project, Status, Blocked), showing its current value.

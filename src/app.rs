@@ -108,6 +108,10 @@ pub enum Mode {
         success: bool,
         stdout: String,
         stderr: String,
+        /// Current scroll offset (in lines) into the rendered output.
+        scroll: u16,
+        /// Total rendered line count, for clamping `scroll`.
+        line_count: u16,
     },
 }
 
@@ -187,6 +191,25 @@ pub struct App {
 }
 
 const ALL_LABEL: &str = "(All)";
+
+/// Mirrors the line count `ui::draw_extension_output` renders, so scroll can
+/// be clamped without the UI layer having to report it back.
+fn output_line_count(stdout: &str, stderr: &str) -> u16 {
+    let mut total = 0u16;
+    if !stdout.is_empty() {
+        total += 1 + stdout.lines().count() as u16;
+    }
+    if !stderr.is_empty() {
+        if total > 0 {
+            total += 1;
+        }
+        total += 1 + stderr.lines().count() as u16;
+    }
+    if stdout.is_empty() && stderr.is_empty() {
+        total += 1;
+    }
+    total
+}
 
 impl App {
     pub fn new() -> Self {
@@ -308,6 +331,8 @@ impl App {
             success: false,
             stdout: String::new(),
             stderr: String::new(),
+            scroll: 0,
+            line_count: 0,
         };
     }
 
@@ -315,12 +340,15 @@ impl App {
         // Ignore results for an extension run the user has already navigated away from.
         if let Mode::ExtensionOutput { name, running, .. } = &self.mode {
             if *running && *name == result.name {
+                let line_count = output_line_count(&result.stdout, &result.stderr);
                 self.mode = Mode::ExtensionOutput {
                     name: result.name,
                     running: false,
                     success: result.success,
                     stdout: result.stdout,
                     stderr: result.stderr,
+                    scroll: 0,
+                    line_count,
                 };
             }
         }
@@ -328,6 +356,23 @@ impl App {
 
     pub fn close_extension_output(&mut self) {
         self.mode = Mode::Normal;
+    }
+
+    /// Scrolls the extension output view by `delta` lines (negative scrolls up),
+    /// clamped to the rendered content's line count.
+    pub fn scroll_extension_output(&mut self, delta: i32) {
+        if let Mode::ExtensionOutput {
+            running,
+            scroll,
+            line_count,
+            ..
+        } = &mut self.mode
+        {
+            if !*running {
+                let max = *line_count as i64;
+                *scroll = (*scroll as i64 + delta as i64).clamp(0, max) as u16;
+            }
+        }
     }
 
     pub fn open_filter_menu(&mut self) {
@@ -498,5 +543,58 @@ impl App {
         } else {
             self.mode = Mode::Normal;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extensions::ExtensionRunResult;
+
+    fn finished_output(stdout: &str, stderr: &str) -> App {
+        let mut app = App::new();
+        app.start_extension("Test".to_string());
+        app.finish_extension(ExtensionRunResult {
+            name: "Test".to_string(),
+            success: true,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        });
+        app
+    }
+
+    #[test]
+    fn scroll_clamps_to_zero_minimum() {
+        let mut app = finished_output("line1\nline2\nline3", "");
+        app.scroll_extension_output(-100);
+        let Mode::ExtensionOutput { scroll, .. } = app.mode else {
+            panic!("expected ExtensionOutput mode");
+        };
+        assert_eq!(scroll, 0);
+    }
+
+    #[test]
+    fn scroll_clamps_to_line_count_maximum() {
+        let mut app = finished_output("line1\nline2\nline3", "");
+        app.scroll_extension_output(i32::MAX);
+        let Mode::ExtensionOutput {
+            scroll, line_count, ..
+        } = app.mode
+        else {
+            panic!("expected ExtensionOutput mode");
+        };
+        assert_eq!(scroll, line_count);
+        assert!(scroll > 0);
+    }
+
+    #[test]
+    fn scroll_does_nothing_while_running() {
+        let mut app = App::new();
+        app.start_extension("Test".to_string());
+        app.scroll_extension_output(5);
+        let Mode::ExtensionOutput { scroll, .. } = app.mode else {
+            panic!("expected ExtensionOutput mode");
+        };
+        assert_eq!(scroll, 0);
     }
 }

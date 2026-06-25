@@ -135,6 +135,16 @@ async fn run(
                         },
                         Mode::ExtensionOutput { .. } => match key.code {
                             KeyCode::Esc | KeyCode::Char('q') => app.close_extension_output(),
+                            KeyCode::Char('j') | KeyCode::Down => app.scroll_extension_output(1),
+                            KeyCode::Char('k') | KeyCode::Up => app.scroll_extension_output(-1),
+                            KeyCode::PageDown | KeyCode::Char('d') => {
+                                app.scroll_extension_output(10)
+                            }
+                            KeyCode::PageUp | KeyCode::Char('u') => {
+                                app.scroll_extension_output(-10)
+                            }
+                            KeyCode::Char('g') => app.scroll_extension_output(i32::MIN),
+                            KeyCode::Char('G') => app.scroll_extension_output(i32::MAX),
                             _ => {}
                         },
                         Mode::FilterMenu { .. } => match key.code {

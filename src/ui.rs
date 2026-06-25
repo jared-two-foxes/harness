@@ -183,7 +183,11 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
                 success,
                 stdout,
                 stderr,
-            } => draw_extension_output(frame, area, name, *running, *success, stdout, stderr),
+                scroll,
+                ..
+            } => draw_extension_output(
+                frame, area, name, *running, *success, stdout, stderr, *scroll,
+            ),
             _ => draw_issue_list(frame, app, area),
         },
     }
@@ -318,13 +322,14 @@ fn draw_extension_output(
     success: bool,
     stdout: &str,
     stderr: &str,
+    scroll: u16,
 ) {
     let title = if running {
         format!("Running: {name}...")
     } else if success {
-        format!("{name} (done)")
+        format!("{name} (done) — line {}", scroll + 1)
     } else {
-        format!("{name} (failed)")
+        format!("{name} (failed) — line {}", scroll + 1)
     };
     let title_style = if running {
         Style::default().fg(Color::Yellow)
@@ -371,7 +376,10 @@ fn draw_extension_output(
         }
     }
 
-    let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let p = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     frame.render_widget(p, area);
 }
 
@@ -396,7 +404,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 .to_string()
         }
         Mode::Detail => "j/k: next/prev issue   esc: back to list".to_string(),
-        Mode::ExtensionOutput { .. } => "esc: back to list".to_string(),
+        Mode::ExtensionOutput { .. } => {
+            "j/k: scroll   u/d: page up/down   g/G: top/bottom   esc: back to list".to_string()
+        }
         Mode::FilterMenu { .. } => {
             "j/k: navigate   enter: edit   c: clear all   esc: close".to_string()
         }
