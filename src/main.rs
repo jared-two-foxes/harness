@@ -98,6 +98,43 @@ fn launch_extension(app: &mut App, key: char, tx: mpsc::UnboundedSender<Extensio
     tokio::spawn(extensions::run(extension, issue, project_root, tx, cancel_rx));
 }
 
+/// Fetches the selected issue's team's available statuses and opens the
+/// picker. A no-op if nothing is selected.
+async fn open_status_picker(app: &mut App, client: &Client) {
+    let Some(issue) = app.selected_issue().cloned() else {
+        return;
+    };
+    match client.fetch_workflow_states(&issue.team.name).await {
+        Ok(states) => app.open_status_picker(states),
+        Err(e) => app.set_error(format!("{e:?}")),
+    }
+}
+
+/// Resolves the active project's team/project to ids and creates the issue
+/// against Linear, dropping it into the list on success. Only callable while
+/// `app.active_project` is set, since that's where the team/project mapping
+/// comes from.
+async fn create_issue(app: &mut App, client: &Client, title: String) {
+    let Some(project) = app.active_project.clone() else {
+        return;
+    };
+    match client
+        .resolve_team_project_ids(&project.team, Some(&project.project))
+        .await
+    {
+        Ok((team_id, project_id)) => {
+            match client
+                .create_issue(&team_id, project_id.as_deref(), &title)
+                .await
+            {
+                Ok(issue) => app.add_issue(issue),
+                Err(e) => app.set_error(format!("{e:?}")),
+            }
+        }
+        Err(e) => app.set_error(format!("{e:?}")),
+    }
+}
+
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
@@ -135,6 +172,12 @@ async fn run(
                                 Ok(issues) => app.set_issues(issues),
                                 Err(e) => app.set_error(format!("{e:?}")),
                             },
+                            KeyCode::Char('s') => open_status_picker(app, client).await,
+                            KeyCode::Char('n') => {
+                                if app.active_project.is_some() {
+                                    app.open_new_issue();
+                                }
+                            }
                             KeyCode::Char(c) => launch_extension(app, c, ext_tx.clone()),
                             _ => {}
                         },
@@ -148,7 +191,33 @@ async fn run(
                             KeyCode::PageUp | KeyCode::Char('u') => app.scroll_detail(-10),
                             KeyCode::Char('g') => app.scroll_detail(i32::MIN),
                             KeyCode::Char('G') => app.scroll_detail(i32::MAX),
+                            KeyCode::Char('s') => open_status_picker(app, client).await,
                             KeyCode::Char(c) => launch_extension(app, c, ext_tx.clone()),
+                            _ => {}
+                        },
+                        Mode::StatusPicker { .. } => match key.code {
+                            KeyCode::Esc => app.status_picker_cancel(),
+                            KeyCode::Char('j') | KeyCode::Down => app.status_picker_move(1),
+                            KeyCode::Char('k') | KeyCode::Up => app.status_picker_move(-1),
+                            KeyCode::Enter => {
+                                if let Some((issue_id, new_state)) = app.status_picker_confirm() {
+                                    match client.update_issue_state(&issue_id, &new_state.id).await {
+                                        Ok(()) => app.apply_state_change(&issue_id, new_state),
+                                        Err(e) => app.set_error(format!("{e:?}")),
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                        Mode::NewIssueTitle { .. } => match key.code {
+                            KeyCode::Esc => app.new_issue_cancel(),
+                            KeyCode::Backspace => app.new_issue_backspace(),
+                            KeyCode::Enter => {
+                                if let Some(title) = app.new_issue_confirm() {
+                                    create_issue(app, client, title).await;
+                                }
+                            }
+                            KeyCode::Char(c) => app.new_issue_input(c),
                             _ => {}
                         },
                         Mode::ExtensionOutput { .. } => match key.code {

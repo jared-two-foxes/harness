@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, FilterKind, LoadState, Mode, FILTER_KINDS};
+use crate::linear::WorkflowState;
 
 fn priority_label(p: f64) -> &'static str {
     match p as i64 {
@@ -54,6 +55,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
             selected,
             checked,
         } => draw_filter_popup(frame, area, *kind, options, *selected, checked),
+        Mode::StatusPicker { options, selected } => {
+            draw_status_picker(frame, area, options, *selected)
+        }
+        Mode::NewIssueTitle { input } => draw_new_issue_prompt(frame, area, input),
         Mode::Detail | Mode::Normal | Mode::ExtensionOutput { .. } => {}
     }
 }
@@ -167,6 +172,50 @@ fn draw_filter_popup(
 
     frame.render_widget(Clear, popup_area);
     frame.render_widget(list, popup_area);
+}
+
+fn draw_status_picker(frame: &mut Frame, area: Rect, options: &[WorkflowState], selected: usize) {
+    let popup_area = centered_popup(area, options.len() as u16 + 2, 40);
+
+    let items: Vec<ListItem> = options
+        .iter()
+        .enumerate()
+        .map(|(i, state)| {
+            let style = if i == selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            ListItem::new(format!("{} [{}]", state.name, state.state_type)).style(style)
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Change status (enter: apply, esc: cancel)")
+            .style(Style::default().bg(Color::Black)),
+    );
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(list, popup_area);
+}
+
+fn draw_new_issue_prompt(frame: &mut Frame, area: Rect, input: &str) {
+    let popup_area = centered_popup(area, 3, 60);
+
+    let p = Paragraph::new(format!("{input}_")).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("New issue title (enter: create, esc: cancel)")
+            .style(Style::default().bg(Color::Black)),
+    );
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(p, popup_area);
 }
 
 fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
@@ -399,11 +448,11 @@ fn extension_hints(app: &App) -> String {
 fn footer_text(app: &App) -> String {
     let base = match &app.mode {
         Mode::Normal => {
-            "j/k: navigate   enter: view details   f: filters   o: sort   r: refresh   q: quit"
+            "j/k: navigate   enter: view details   f: filters   o: sort   s: status   n: new issue   r: refresh   q: quit"
                 .to_string()
         }
         Mode::Detail => {
-            "j/k: scroll   u/d: page up/down   g/G: top/bottom   esc: back to list".to_string()
+            "j/k: scroll   u/d: page up/down   g/G: top/bottom   s: status   esc: back to list".to_string()
         }
         Mode::ExtensionOutput { .. } => {
             let running = app.extension_run.as_ref().is_some_and(|r| r.running);
@@ -422,6 +471,8 @@ fn footer_text(app: &App) -> String {
             "j/k: navigate   space: toggle   enter: apply   esc: back".to_string()
         }
         Mode::Filter { .. } => "j/k: navigate   enter: select   esc: back".to_string(),
+        Mode::StatusPicker { .. } => "j/k: navigate   enter: apply   esc: cancel".to_string(),
+        Mode::NewIssueTitle { .. } => "type a title   enter: create   esc: cancel".to_string(),
     };
 
     let mut text = base;
@@ -514,7 +565,7 @@ mod tests {
             description: String::new(),
         }];
 
-        let backend = TestBackend::new(40, 20);
+        let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
 

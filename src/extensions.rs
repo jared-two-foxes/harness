@@ -8,7 +8,7 @@ use crate::linear::Issue;
 
 /// Keys already used by the core UI; extensions configured to use these are skipped.
 const RESERVED_KEYS: &[char] = &[
-    'q', 'j', 'k', 'o', 'r', 'f', 'l', 'h', 'c', 'd', 'u', 'g', 'G', 'K',
+    'q', 'j', 'k', 'o', 'r', 'f', 'l', 'h', 'c', 'd', 'u', 'g', 'G', 'K', 's', 'n',
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -239,10 +239,12 @@ mod tests {
             title: "Fix the thing".to_string(),
             priority: 2.0,
             state: State {
+                id: "state-1".to_string(),
                 name: "Todo".to_string(),
                 state_type: "unstarted".to_string(),
             },
             team: Team {
+                id: "team-1".to_string(),
                 name: "Staging Assistant".to_string(),
                 key: "SA".to_string(),
             },

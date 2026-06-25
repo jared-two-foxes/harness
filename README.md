@@ -26,6 +26,8 @@ cargo run
 | `Enter` / `l` | View selected issue's details  |
 | `f`         | Open the filters menu             |
 | `o`         | Toggle sort order (updated / priority) |
+| `s`         | Change the selected issue's status     |
+| `n`         | Create a new issue (needs an active project mapping — see below) |
 | `r`         | Refresh issues from Linear       |
 | `q` / `Esc` | Quit                             |
 
@@ -36,7 +38,35 @@ cargo run
 | `j` / `k`       | Scroll one line                          |
 | `u` / `d` / `PageUp` / `PageDown` | Scroll one page         |
 | `g` / `G`       | Jump to top / bottom                     |
+| `s`             | Change the selected issue's status       |
 | `Esc` / `Enter` / `q` / `h` | Back to the issue list       |
+
+### Status picker (`s`)
+
+Shows every workflow state configured for the issue's team (e.g. Todo, In Progress,
+Done, Canceled), with the current one pre-selected. This is the way to flag a ticket
+complete — pick the team's "Done"-type state and confirm.
+
+| Key             | Action                                  |
+|-----------------|------------------------------------------|
+| `j` / `k`       | Move cursor                              |
+| `Enter`         | Apply and return to the previous view    |
+| `Esc`           | Cancel                                   |
+
+### New issue prompt (`n`)
+
+Type a title and press `Enter` to create a new issue against the active project's
+team/project mapping (see "Project mapping" below) — disabled if harness wasn't
+launched inside a mapped repo, since there'd be nothing to create it against. Useful
+for creating a throwaway test ticket to try out status changes against, without
+touching real backlog items.
+
+| Key             | Action                                  |
+|-----------------|------------------------------------------|
+| any character   | Append to the title                      |
+| `Backspace`     | Remove the last character                |
+| `Enter`         | Create the issue                         |
+| `Esc`           | Cancel                                   |
 
 ### Extension output view
 
@@ -76,6 +106,8 @@ Editing a single filter:
 - Lists all issues in the workspace, sorted by last-updated or priority
 - Full-screen detail view with team, assignee, state, priority, blocked status, and a markdown-rendered description
 - Filter issues by team, project, status (multi-select), and blocked state (any / unblocked only / blocked only), all from one consolidated filters menu
+- Change an issue's status (e.g. mark it Done) from a picker scoped to its team's actual workflow states
+- Create new issues against the active project's team/project mapping
 - Blocked issues (per Linear's issue relations) are marked with a `!` in the list and called out in the detail view
 - Extensible: bind custom hotkeys to external commands (e.g. your own AI code-generation scripts) that run against the selected issue
 - Project-aware: maps a local repo path to its Linear team/project so the issue list opens pre-scoped and extension commands know which repo to run in
@@ -125,7 +157,7 @@ additional lines when it doesn't fit the terminal width, instead of silently cli
 up to 3 lines, after which it's truncated.
 
 Extensions can be triggered from the issue list or the detail view. Keys already used
-by the core UI (`q j k o r f l h c d u g G K`) are reserved — any extension bound to one
+by the core UI (`q j k o r f l h c d u g G K s n`) are reserved — any extension bound to one
 of those, or to a key another extension already claims, is skipped with a warning
 printed to stderr on startup. Bound extensions show up in the footer alongside the
 built-in keys, and whenever one is running you'll see a `● <name> running...` indicator

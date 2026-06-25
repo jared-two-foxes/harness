@@ -1,7 +1,7 @@
 use tokio::sync::oneshot;
 
 use crate::extensions::Extension;
-use crate::linear::Issue;
+use crate::linear::{Issue, State, WorkflowState};
 use crate::project::Project;
 
 pub enum LoadState {
@@ -110,6 +110,17 @@ pub enum Mode {
     ExtensionOutput {
         /// Current scroll offset (in lines) into the rendered output.
         scroll: u16,
+    },
+    /// Picking a new status for the selected issue, from its team's
+    /// available workflow states.
+    StatusPicker {
+        options: Vec<WorkflowState>,
+        selected: usize,
+    },
+    /// Typing a title for a brand-new issue, created against the active
+    /// project's team/project mapping.
+    NewIssueTitle {
+        input: String,
     },
 }
 
@@ -595,11 +606,257 @@ impl App {
             self.mode = Mode::Normal;
         }
     }
+
+    /// Opens the status picker for the selected issue, pre-selecting its
+    /// current status if it's among the given options.
+    pub fn open_status_picker(&mut self, options: Vec<WorkflowState>) {
+        let Some(issue) = self.selected_issue() else {
+            return;
+        };
+        let selected = options
+            .iter()
+            .position(|s| s.id == issue.state.id)
+            .unwrap_or(0);
+        self.mode = Mode::StatusPicker { options, selected };
+    }
+
+    pub fn status_picker_move(&mut self, delta: i32) {
+        if let Mode::StatusPicker { options, selected } = &mut self.mode {
+            let len = options.len() as i32;
+            if len > 0 {
+                *selected = ((*selected as i32 + delta).rem_euclid(len)) as usize;
+            }
+        }
+    }
+
+    pub fn status_picker_cancel(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
+    /// Closes the picker and, if a selection was made, returns the selected
+    /// issue's id plus the chosen status for the caller to submit to the API.
+    pub fn status_picker_confirm(&mut self) -> Option<(String, WorkflowState)> {
+        let result = if let Mode::StatusPicker { options, selected } = &self.mode {
+            self.selected_issue()
+                .map(|issue| (issue.id.clone(), options[*selected].clone()))
+        } else {
+            None
+        };
+        self.mode = Mode::Normal;
+        result
+    }
+
+    /// Applies a status change that's already succeeded against the API, to
+    /// both the unfiltered and (after re-filtering) the visible issue list.
+    /// Re-running the filters matters since the new status may no longer
+    /// match an active status filter; the previously-selected issue stays
+    /// selected if it's still visible afterwards.
+    pub fn apply_state_change(&mut self, issue_id: &str, new_state: WorkflowState) {
+        let current_id = self.selected_issue().map(|i| i.id.clone());
+        if let Some(issue) = self.all_issues.iter_mut().find(|i| i.id == issue_id) {
+            issue.state = State {
+                id: new_state.id,
+                name: new_state.name,
+                state_type: new_state.state_type,
+            };
+        }
+        self.apply_filters();
+        if let Some(id) = current_id {
+            if let Some(pos) = self.issues.iter().position(|i| i.id == id) {
+                self.selected = pos;
+            }
+        }
+    }
+
+    /// Opens the new-issue title prompt. Only meaningful when there's an
+    /// active project mapping, since that's what supplies the team/project
+    /// the new issue gets created against.
+    pub fn open_new_issue(&mut self) {
+        self.mode = Mode::NewIssueTitle {
+            input: String::new(),
+        };
+    }
+
+    pub fn new_issue_input(&mut self, c: char) {
+        if let Mode::NewIssueTitle { input } = &mut self.mode {
+            input.push(c);
+        }
+    }
+
+    pub fn new_issue_backspace(&mut self) {
+        if let Mode::NewIssueTitle { input } = &mut self.mode {
+            input.pop();
+        }
+    }
+
+    pub fn new_issue_cancel(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
+    /// Closes the prompt and, if a non-empty title was entered, returns it
+    /// for the caller to submit to the API.
+    pub fn new_issue_confirm(&mut self) -> Option<String> {
+        let title = if let Mode::NewIssueTitle { input } = &self.mode {
+            let trimmed = input.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        } else {
+            None
+        };
+        self.mode = Mode::Normal;
+        title
+    }
+
+    /// Inserts a newly created issue (already confirmed against the API)
+    /// into the list, re-applies filters, and selects it.
+    pub fn add_issue(&mut self, issue: Issue) {
+        let id = issue.id.clone();
+        self.all_issues.push(issue);
+        self.apply_filters();
+        if let Some(pos) = self.issues.iter().position(|i| i.id == id) {
+            self.selected = pos;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linear::{Assignee, RelationConnection, Team};
+
+    fn sample_issue(id: &str, identifier: &str, state_id: &str, state_name: &str) -> Issue {
+        Issue {
+            id: id.to_string(),
+            identifier: identifier.to_string(),
+            title: format!("Issue {identifier}"),
+            priority: 0.0,
+            state: State {
+                id: state_id.to_string(),
+                name: state_name.to_string(),
+                state_type: "unstarted".to_string(),
+            },
+            team: Team {
+                id: "team-1".to_string(),
+                name: "Staging Assistant".to_string(),
+                key: "SA".to_string(),
+            },
+            project: None,
+            updated_at: "2026-01-01T00:00:00.000Z".to_string(),
+            url: "https://linear.app/x/issue/1".to_string(),
+            description: None,
+            assignee: None::<Assignee>,
+            inverse_relations: RelationConnection { nodes: Vec::new() },
+        }
+    }
+
+    fn workflow_state(id: &str, name: &str) -> WorkflowState {
+        WorkflowState {
+            id: id.to_string(),
+            name: name.to_string(),
+            state_type: "started".to_string(),
+            position: 0.0,
+        }
+    }
+
+    #[test]
+    fn status_picker_preselects_the_issues_current_state() {
+        let mut app = App::new();
+        app.set_issues(vec![sample_issue("1", "SA-1", "state-todo", "Todo")]);
+        let options = vec![
+            workflow_state("state-todo", "Todo"),
+            workflow_state("state-done", "Done"),
+        ];
+        app.open_status_picker(options);
+        match app.mode {
+            Mode::StatusPicker { selected, .. } => assert_eq!(selected, 0),
+            _ => panic!("expected StatusPicker mode"),
+        }
+    }
+
+    #[test]
+    fn confirming_status_picker_returns_issue_id_and_chosen_state() {
+        let mut app = App::new();
+        app.set_issues(vec![sample_issue("1", "SA-1", "state-todo", "Todo")]);
+        app.open_status_picker(vec![
+            workflow_state("state-todo", "Todo"),
+            workflow_state("state-done", "Done"),
+        ]);
+        app.status_picker_move(1);
+        let (issue_id, new_state) = app.status_picker_confirm().expect("a selection");
+        assert_eq!(issue_id, "1");
+        assert_eq!(new_state.name, "Done");
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn apply_state_change_updates_the_issue_and_keeps_it_selected() {
+        let mut app = App::new();
+        app.set_issues(vec![
+            sample_issue("1", "SA-1", "state-todo", "Todo"),
+            sample_issue("2", "SA-2", "state-todo", "Todo"),
+        ]);
+        app.selected = 1;
+        app.apply_state_change("2", workflow_state("state-done", "Done"));
+
+        let updated = app.all_issues.iter().find(|i| i.id == "2").unwrap();
+        assert_eq!(updated.state.name, "Done");
+        assert_eq!(app.selected_issue().unwrap().id, "2");
+    }
+
+    #[test]
+    fn apply_state_change_drops_issue_out_of_view_when_filtered_out() {
+        let mut app = App::new();
+        app.set_issues(vec![sample_issue("1", "SA-1", "state-todo", "Todo")]);
+        app.filters.status = vec!["Todo".to_string()];
+        app.apply_filters();
+        assert_eq!(app.issues.len(), 1);
+
+        app.apply_state_change("1", workflow_state("state-done", "Done"));
+        assert!(app.issues.is_empty(), "issue should be filtered out once its status no longer matches");
+    }
+
+    #[test]
+    fn new_issue_prompt_collects_typed_title_and_trims_it() {
+        let mut app = App::new();
+        app.open_new_issue();
+        for c in "  Fix the bug  ".chars() {
+            app.new_issue_input(c);
+        }
+        let title = app.new_issue_confirm().expect("non-empty title");
+        assert_eq!(title, "Fix the bug");
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn new_issue_prompt_rejects_blank_title() {
+        let mut app = App::new();
+        app.open_new_issue();
+        for c in "   ".chars() {
+            app.new_issue_input(c);
+        }
+        assert!(app.new_issue_confirm().is_none());
+    }
+
+    #[test]
+    fn backspace_removes_last_character_of_new_issue_title() {
+        let mut app = App::new();
+        app.open_new_issue();
+        app.new_issue_input('a');
+        app.new_issue_input('b');
+        app.new_issue_backspace();
+        match &app.mode {
+            Mode::NewIssueTitle { input } => assert_eq!(input, "a"),
+            _ => panic!("expected NewIssueTitle mode"),
+        }
+    }
+
+    #[test]
+    fn add_issue_inserts_and_selects_the_new_issue() {
+        let mut app = App::new();
+        app.set_issues(vec![sample_issue("1", "SA-1", "state-todo", "Todo")]);
+        app.add_issue(sample_issue("2", "SA-2", "state-todo", "Todo"));
+        assert_eq!(app.all_issues.len(), 2);
+        assert_eq!(app.selected_issue().unwrap().id, "2");
+    }
 
     fn app_with_lines(lines: &[&str]) -> App {
         let mut app = App::new();
