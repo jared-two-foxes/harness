@@ -104,10 +104,17 @@ pub async fn run(
 ) -> ExtensionRunResult {
     let cmd_str = build_command(&extension.command, issue, project_root);
 
+    // On Windows, `arg()` would quote the whole command string as a single
+    // CreateProcess argument (since it contains spaces), and that extra
+    // layer of quoting collides with the command's own embedded quotes
+    // (e.g. around `{project_root}`), corrupting paths passed to `cd /d`.
+    // `raw_arg` appends text verbatim, since cmd.exe's `/C` doesn't follow
+    // normal argv quoting rules anyway.
     #[cfg(windows)]
     let mut command = {
-        let mut c = tokio::process::Command::new("cmd");
-        c.arg("/C").arg(&cmd_str);
+        use tokio::process::Command;
+        let mut c = Command::new("cmd");
+        c.raw_arg("/C").raw_arg(&cmd_str);
         c
     };
     #[cfg(not(windows))]
@@ -192,6 +199,30 @@ mod tests {
         let result = run(&extension, &sample_issue(), None).await;
         assert!(result.success);
         assert!(result.stdout.contains("hello SA-1"));
+    }
+
+    /// Regression test: a command with `cd` into a quoted path plus other
+    /// quoted args used to fail on Windows ("The filename, directory name,
+    /// or volume label syntax is incorrect") because `arg()` wrapped the
+    /// whole already-quoted command string in another layer of quoting.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn runs_quoted_cd_command_without_corrupting_path() {
+        let dir = std::env::temp_dir();
+        let dir_str = dir.display().to_string();
+        let extension = Extension {
+            key: 'g',
+            name: "CdTest".to_string(),
+            command: format!(r#"cd /d "{}" && echo ok {{identifier}}"#, dir_str),
+            description: String::new(),
+        };
+        let result = run(&extension, &sample_issue(), None).await;
+        assert!(
+            result.success,
+            "stdout={:?} stderr={:?}",
+            result.stdout, result.stderr
+        );
+        assert!(result.stdout.contains("ok SA-1"));
     }
 
     #[test]
