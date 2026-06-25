@@ -120,6 +120,10 @@ Available placeholders, substituted from the selected issue before the command r
 | `{assignee}`   | Assignee name (empty if unassigned)      |
 | `{project_root}` | Root path of the active project mapping (see below), empty if none |
 
+The footer (control hints + active extensions + the running indicator) wraps onto
+additional lines when it doesn't fit the terminal width, instead of silently clipping —
+up to 3 lines, after which it's truncated.
+
 Extensions can be triggered from the issue list or the detail view. Keys already used
 by the core UI (`q j k o r f l h c d u g G K`) are reserved — any extension bound to one
 of those, or to a key another extension already claims, is skipped with a warning

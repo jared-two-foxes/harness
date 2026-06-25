@@ -28,15 +28,23 @@ fn priority_color(p: f64) -> Color {
     }
 }
 
+/// Footer text wraps onto multiple lines rather than silently clipping once
+/// filters/extension hints make it longer than the terminal is wide, but is
+/// capped so it can't eat the whole screen in a narrow terminal.
+const MAX_FOOTER_LINES: u16 = 3;
+
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let footer = footer_text(app);
+    let footer_height = wrapped_line_count(&footer, area.width).clamp(1, MAX_FOOTER_LINES);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([Constraint::Min(0), Constraint::Length(footer_height)])
         .split(area);
 
     draw_body(frame, app, chunks[0]);
-    draw_footer(frame, app, chunks[1]);
+    draw_footer(frame, &footer, chunks[1]);
 
     match &app.mode {
         Mode::FilterMenu { selected } => draw_filter_menu(frame, area, app, *selected),
@@ -388,7 +396,7 @@ fn extension_hints(app: &App) -> String {
         .join("   ")
 }
 
-fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+fn footer_text(app: &App) -> String {
     let base = match &app.mode {
         Mode::Normal => {
             "j/k: navigate   enter: view details   f: filters   o: sort   r: refresh   q: quit"
@@ -428,7 +436,99 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             text.push_str(&format!("   |   {hints}"));
         }
     }
+    text
+}
 
-    let p = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
+/// Estimates how many lines greedy word-wrapping `text` at `width` columns
+/// needs, so the footer's layout slot can be sized to fit instead of
+/// silently clipping. Doesn't need to match ratatui's own wrapping exactly —
+/// just needs to be a reasonable (slight overestimate is fine) lower bound.
+fn wrapped_line_count(text: &str, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    let mut lines = 1u16;
+    let mut current = 0usize;
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        let needed = if current == 0 {
+            word_len
+        } else {
+            current + 1 + word_len
+        };
+        if needed > width {
+            lines += 1;
+            current = word_len.min(width);
+        } else {
+            current = needed;
+        }
+    }
+    lines
+}
+
+fn draw_footer(frame: &mut Frame, text: &str, area: Rect) {
+    let p = Paragraph::new(text)
+        .style(Style::default().fg(Color::DarkGray))
+        .wrap(Wrap { trim: true });
     frame.render_widget(p, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extensions::Extension;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn fits_on_one_line_when_short_enough() {
+        assert_eq!(wrapped_line_count("j/k: navigate   q: quit", 80), 1);
+    }
+
+    #[test]
+    fn wraps_to_multiple_lines_when_too_long_for_width() {
+        let text = "j/k: navigate   enter: view details   f: filters   o: sort   r: refresh   q: quit   |   x: Check ticket (plan it)   g: Resolve ticket (implement it)";
+        let lines = wrapped_line_count(text, 40);
+        assert!(lines > 1, "expected wrapping, got {lines} line(s)");
+    }
+
+    #[test]
+    fn clamped_height_never_exceeds_max_footer_lines() {
+        let very_long = "word ".repeat(200);
+        let lines = wrapped_line_count(&very_long, 10).clamp(1, MAX_FOOTER_LINES);
+        assert_eq!(lines, MAX_FOOTER_LINES);
+    }
+
+    /// End-to-end regression test for the original bug: the footer used to
+    /// get a fixed 1-row slot, so anything past the first line silently
+    /// disappeared off the edge of the terminal. Render to a real buffer at
+    /// a narrow width with a footer that needs 2 lines (comfortably within
+    /// `MAX_FOOTER_LINES`) and check the second extension's name actually
+    /// made it onto screen, instead of being cut off past row 1.
+    #[test]
+    fn long_footer_wraps_instead_of_clipping_to_one_line() {
+        let mut app = App::new();
+        app.load_state = LoadState::Loaded;
+        app.extensions = vec![Extension {
+            key: 'z',
+            name: "Resolve ticket".to_string(),
+            command: "echo".to_string(),
+            description: String::new(),
+        }];
+
+        let backend = TestBackend::new(40, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered: String = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(
+            rendered.contains("Resolve ticket"),
+            "expected the extension's name to appear on screen instead of \
+             being clipped off the single-line footer, got buffer:\n{rendered}"
+        );
+    }
 }
